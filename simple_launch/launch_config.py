@@ -27,12 +27,15 @@ from typing import Dict, List, Optional, Set, Text, Tuple
 from launch import Substitution
 from launch.actions import Shutdown
 from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.condition import Condition
 from launch.conditions import evaluate_condition_expression
 from launch.launch_context import LaunchContext
 from launch.logging import get_logger
 from launch.substitutions import LaunchConfiguration, TextSubstitution
 from launch.utilities import normalize_to_list_of_substitutions, perform_substitutions
-from launch_ros.actions import Node
+from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
+from launch_ros.descriptions import ComposableNode
+from launch_ros.utilities import make_namespace_absolute, prefix_namespace
 
 from .param_overrides import full_node_name, launch_global, read_yaml_mapping
 
@@ -372,3 +375,121 @@ class ConfiguredNode(Node):
             reason = f'{full_name} exited and is required'
             context.register_event_handler(OnProcessExit(
                 target_action=self, on_exit=[Shutdown(reason=reason)]))
+
+
+def logger_name(full_name: Text) -> Text:
+    '''
+    Returns the logger name of a node, e.g. navigation.controller_server for /navigation/controller_server
+    '''
+    return full_name.strip('/').replace('/', '.')
+
+
+def component_full_name(context: LaunchContext, description: ComposableNode) -> Text:
+    '''
+    Returns the full name of a composable node, as its container will load it. A component
+    given no name is matched by the class name of its plugin.
+    '''
+    namespace = None
+    if description.node_namespace is not None:
+        namespace = perform_substitutions(context, description.node_namespace)
+    namespace = prefix_namespace(context.launch_configurations.get('ros_namespace'), namespace)
+    if description.node_name is not None:
+        name = perform_substitutions(context, description.node_name)
+    else:
+        name = perform_substitutions(context, description.node_plugin).split('::')[-1]
+    return make_namespace_absolute(prefix_namespace(namespace, name))
+
+
+def component_settings(context: LaunchContext, description: ComposableNode,
+                       container: Text) -> Tuple[Text, NodeSettings]:
+    '''
+    Returns the full name and the settings of a component of this container. Logs them, and
+    warns about the settings that act on a process, since the component shares its container's.
+    '''
+    full_name = component_full_name(context, description)
+    settings, rules = settings_of(context, full_name)
+    logger = get_logger('simple_launch')
+    per_process = [key for key in ('prefix', 'required', 'respawn', 'debug')
+                   if getattr(settings, key) not in (None, False)]
+    if per_process:
+        logger.warning(f'{ARG_NAME}: {full_name} is a component, {per_process} '
+                       'apply to its container only')
+    log_summary(context, f'{describe(full_name, settings, rules)}, in {container}')
+    return full_name, settings
+
+
+class ComponentEnabled(Condition):
+    '''
+    Condition of a composable node: the condition it was given, and its enabled setting
+    '''
+
+    def __init__(self, given: Optional[Condition] = None):
+        super().__init__(predicate=self.__evaluate)
+        self.__given = given
+        # set by SimpleLauncher.node(), once the description exists
+        self.description = None
+
+    def __evaluate(self, context: LaunchContext) -> bool:
+        if self.__given is not None and not self.__given.evaluate(context):
+            return False
+        full_name = component_full_name(context, self.description)
+        if not settings_of(context, full_name)[0].enabled:
+            # launch_ros evaluates the condition twice per component, report it once
+            reported = launch_global(context, 'simple_launch_not_loaded', set)
+            if full_name not in reported:
+                reported.add(full_name)
+                get_logger('simple_launch').info(
+                    f'{ARG_NAME}: {full_name} not loaded, enabled is false')
+            return False
+        return True
+
+
+class ConfiguredContainer(ConfiguredNode, ComposableNodeContainer):
+    '''
+    Container whose own settings come from the launch_config file, like a ConfiguredNode.
+    The log levels of its components are given to its process, which holds their loggers.
+    Settings that act on a process (prefix, required, respawn, debug) apply only to the container.
+    '''
+
+    def __init__(self, *, composable_node_descriptions=None, **kwargs):
+        super().__init__(composable_node_descriptions=composable_node_descriptions, **kwargs)
+        self.__components = composable_node_descriptions or []
+
+    def _configure(self, context: LaunchContext) -> Tuple[Text, List[Text]]:
+        container, patterns = super()._configure(context)
+        for description in self.__components:
+            full_name, settings = component_settings(context, description, container)
+            if settings.log_level and description.node_name is None:
+                # its logger is named by its constructor, which launch cannot see
+                get_logger('simple_launch').warning(
+                    f'{ARG_NAME}: {full_name} has no name in its launch file, '
+                    'so its log_level does not apply: give it a name')
+                continue
+            # the components share the container's process: each gets its own logger's level
+            self.cmd.extend(log_args(settings, logger_name(full_name)))
+        return container, patterns
+
+
+class ConfiguredLoad(LoadComposableNodes):
+    '''
+    Loads components into a container started elsewhere, unless the launch is a dry run.
+    Their log levels cannot reach that container's process, so a log_level setting is warned about.
+    '''
+
+    def __init__(self, *, composable_node_descriptions, target_container, **kwargs):
+        super().__init__(composable_node_descriptions=composable_node_descriptions,
+                         target_container=target_container, **kwargs)
+        self.__components = composable_node_descriptions
+        self.__container = normalize_to_list_of_substitutions(target_container)
+
+    def execute(self, context: LaunchContext):
+        container = perform_substitutions(context, self.__container)
+        for description in self.__components:
+            full_name, settings = component_settings(context, description, container)
+            if settings.log_level:
+                get_logger('simple_launch').warning(
+                    f'{ARG_NAME}: {full_name} goes into {container}, started elsewhere: '
+                    'its log_level does not apply')
+        if is_dry_run(context):
+            return None
+        return super().execute(context)

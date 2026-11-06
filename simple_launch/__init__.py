@@ -13,7 +13,7 @@ from .group import Group
 from . import console
 from .gazebo import only_show_args, silent_exec, GazeboBridge, ros_gz_prefix, gz_launch_setup
 from .param_overrides import MergedOverrides
-from .launch_config import ConfiguredNode
+from .launch_config import ComponentEnabled, ConfiguredContainer, ConfiguredLoad, ConfiguredNode
 from typing import Text, List, Iterable, Tuple, Union
 
 NODE_REMAPS = LAUNCH_ARGS = 1
@@ -329,12 +329,12 @@ class SimpleLauncher:
             # store ComposableNodes inside a Container
             if existing:
                 self.add_action(
-                    LoadComposableNodes(
+                    ConfiguredLoad(
                         composable_node_descriptions = composed,
                         target_container=name))
             else:
                 self.add_action(
-                    ComposableNodeContainer(
+                    ConfiguredContainer(
                         name=name,
                         namespace=namespace,
                         package=package,
@@ -408,7 +408,11 @@ class SimpleLauncher:
             # check plugin name - add package if needed
             if '::' not in plugin:
                 plugin = '{}::{}'.format(package, plugin)
-            return self.add_action(ComposableNode(package=package, plugin=plugin, **node_args))
+            # its enabled setting is checked when the container loads it
+            condition = ComponentEnabled(node_args.pop('condition', None))
+            component = ComposableNode(package=package, plugin=plugin, condition=condition, **node_args)
+            condition.description = component
+            return self.add_action(component)
 
         # basic node, with the settings of the launch_config file
         node = ConfiguredNode(package=package, executable=executable, **node_args)

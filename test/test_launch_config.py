@@ -15,7 +15,7 @@ from launch_ros.substitutions import find_package
 
 from simple_launch import SimpleLauncher
 from simple_launch import launch_config
-from simple_launch.launch_config import (ConfiguredNode, describe, load_rules,
+from simple_launch.launch_config import (ConfiguredNode, describe, load_rules, logger_name,
                                          resolve, unmatched_rules)
 
 
@@ -390,3 +390,105 @@ def test_empty_debug_mapping_uses_the_defaults(tmp_path, fake_package):
     node._configure(context)
 
     assert prefix_of(node, context).startswith('gdbserver --once 127.0.0.1:')
+
+
+def test_logger_name():
+    assert logger_name('/navigation/controller_server') == 'navigation.controller_server'
+    assert logger_name('/rviz2') == 'rviz2'
+
+
+def container_with(sl_setup):
+    sl = SimpleLauncher()
+    with sl.container('perception_container', package='rclcpp_components'):
+        sl_setup(sl)
+    return [a for a in sl.launch_description().entities
+            if isinstance(a, launch_config.ConfiguredContainer)][0]
+
+
+def test_component_full_name_uses_the_pushed_namespace():
+    from launch_ros.descriptions import ComposableNode
+    context = context_for('', '/perception')
+
+    named = ComposableNode(package='pkg', plugin='pkg::Detector', name='detector')
+    unnamed = ComposableNode(package='pkg', plugin='pkg::Detector')
+    absolute = ComposableNode(package='pkg', plugin='pkg::Detector', name='d', namespace='/other')
+
+    assert launch_config.component_full_name(context, named) == '/perception/detector'
+    assert launch_config.component_full_name(context, unnamed) == '/perception/Detector'
+    assert launch_config.component_full_name(context, absolute) == '/other/d'
+
+
+def test_container_takes_the_log_levels_of_its_components(tmp_path):
+    config = write_config(tmp_path, {
+        '/perception/detector': {'log_level': 'debug'},
+        '/perception/perception_container': {'log_level': 'warn'},
+    })
+    container = container_with(lambda sl: (sl.node('pkg', plugin='Detector', name='detector'),
+                                           sl.node('pkg', plugin='Tracker', name='tracker')))
+    context = context_for(config, '/perception')
+
+    container._configure(context)
+
+    args = command(container, context)
+    assert args[-4:] == ['--log-level', 'warn', '--log-level', 'perception.detector:=debug']
+
+
+def test_unnamed_component_gets_no_log_level(tmp_path, monkeypatch):
+    # its logger is named in its constructor, not after its plugin class
+    config = write_config(tmp_path, {'/perception/Detector': {'log_level': 'debug'}})
+    container = container_with(lambda sl: sl.node('pkg', plugin='Detector'))
+    context = context_for(config, '/perception')
+    warnings = []
+    monkeypatch.setattr(launch_config, 'get_logger', lambda name: type(
+        'Logger', (), {'warning': lambda self, m: warnings.append(m),
+                       'info': lambda self, m: None, 'debug': lambda self, m: None})())
+
+    container._configure(context)
+
+    assert '--log-level' not in command(container, context)
+    assert warnings == ['launch_config: /perception/Detector has no name in its launch file, '
+                        'so its log_level does not apply: give it a name']
+
+
+def test_disabled_component_is_not_loaded(tmp_path):
+    config = write_config(tmp_path, {'/perception/tracker': {'enabled': False}})
+    container = container_with(lambda sl: (sl.node('pkg', plugin='Detector', name='detector'),
+                                           sl.node('pkg', plugin='Tracker', name='tracker')))
+    context = context_for(config, '/perception')
+
+    components = container._ConfiguredContainer__components
+    assert [c.condition().evaluate(context) for c in components] == [True, False]
+
+
+def test_disabled_component_is_reported_once(tmp_path, monkeypatch):
+    config = write_config(tmp_path, {'/perception/tracker': {'enabled': False}})
+    container = container_with(lambda sl: sl.node('pkg', plugin='Tracker', name='tracker'))
+    context = context_for(config, '/perception')
+    infos = []
+    monkeypatch.setattr(launch_config, 'get_logger', lambda name: type(
+        'Logger', (), {'info': lambda self, m: infos.append(m)})())
+
+    # launch_ros evaluates it once in the container and once in the load request
+    condition = container._ConfiguredContainer__components[0].condition()
+    assert not condition.evaluate(context)
+    assert not condition.evaluate(context)
+    assert infos == ['launch_config: /perception/tracker not loaded, enabled is false']
+
+
+def test_existing_container_warns_about_log_level_and_skips_a_dry_run(tmp_path, monkeypatch):
+    config = write_config(tmp_path, {'/perception/detector': {'log_level': 'debug'}})
+    sl = SimpleLauncher()
+    with sl.container('perception_container', existing=True):
+        sl.node('pkg', plugin='Detector', name='detector')
+    load = [a for a in sl.launch_description().entities
+            if isinstance(a, launch_config.ConfiguredLoad)][0]
+    context = context_for(config, '/perception')
+    context.launch_configurations['dry_run'] = 'true'
+    warnings = []
+    monkeypatch.setattr(launch_config, 'get_logger', lambda name: type(
+        'Logger', (), {'warning': lambda self, m: warnings.append(m),
+                       'info': lambda self, m: None, 'debug': lambda self, m: None})())
+
+    assert load.execute(context) is None
+    assert warnings == ['launch_config: /perception/detector goes into perception_container, '
+                        'started elsewhere: its log_level does not apply']

@@ -265,11 +265,12 @@ ros2 launch my_pkg system_launch.py launch_config:=dev.yaml
 - The settings are resolved when the node starts, so the namespaces pushed by including files are part of its name.
 - Like `param_overrides`, the argument is not declared by `SimpleLauncher`: declare it in the top-level file to give it a default.
 - `dry_run:=true` logs the settings each node created with `sl.node` would get and the rules that gave them, and starts none of them. Processes started otherwise still start: included launch files that do not use `SimpleLauncher`, and `ExecuteProcess` actions.
+- In a container created with `sl.container`, each component is matched by its own full name (its plugin class name when it has no name). `enabled` and `log_level` act on the component, `log_level` only when the component has a name, since its logger is otherwise named by its constructor; the settings that act on a process (`prefix`, `required`, `respawn`, `debug`) apply to the container only. Components loaded with `existing=True` go into a process started elsewhere: only `enabled` applies, and a `log_level` is warned about.
 - An unknown setting or a value of the wrong type stops the launch. A rule that matched no node, often a mistyped pattern, is logged when the launch shuts down.
 
 | Setting | Effect |
 |---|---|
-| `log_level` | default level of the node's process, given after the node's own arguments so that it wins over a default level set in the launch file. Also takes a mapping of logger names to levels, `default` being the process: `{default: info, rcl: error}` |
+| `log_level` | default level of the node's process, given after the node's own arguments so that it wins over a default level set in the launch file. A component in a container gets the level of its own logger instead. Also takes a mapping of logger names to levels, `default` being the process: `{default: info, rcl: error}` |
 | `enabled` | `false` leaves the node out of the launch, e.g. to run it from a debugger while the rest of the system runs |
 | `required` | `true` shuts the whole launch down when the node exits, as `required` does in XML launch files |
 | `respawn`, `respawn_delay` | start the node again when it dies, after this many seconds. Without them, the node keeps the values of its launch file |
