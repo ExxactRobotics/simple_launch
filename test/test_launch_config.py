@@ -3,11 +3,15 @@ Unit tests of the launch_config settings and of their effect on the nodes of Sim
 Run with: python3 -m pytest test/test_launch_config.py
 '''
 
+import sys
+
 import pytest
 import yaml
 from launch import LaunchContext
 from launch.event_handlers import OnProcessExit
+from launch.substitutions import LaunchConfiguration
 from launch.utilities import perform_substitutions
+from launch_ros.substitutions import find_package
 
 from simple_launch import SimpleLauncher
 from simple_launch import launch_config
@@ -302,3 +306,87 @@ def test_respawn_delay_must_be_a_number(tmp_path):
 def test_respawn_delay_refuses_a_boolean(tmp_path):
     with pytest.raises(RuntimeError, match='must be a int/float'):
         load_rules(write_config(tmp_path, {'*': {'respawn_delay': True}}))
+
+
+@pytest.fixture
+def fake_package(tmp_path, monkeypatch):
+    lib = tmp_path / 'lib' / 'pkg'
+    lib.mkdir(parents=True)
+    (lib / 'cpp_exe').write_bytes(b'\x7fELF' + bytes(12))
+    (lib / 'py_exe').write_text('#!/usr/bin/python3\n')
+    for exe in lib.iterdir():
+        exe.chmod(0o755)
+    # launch_ros finds the executables of a package under <prefix>/lib/<package>
+    monkeypatch.setattr(find_package, 'get_package_prefix', lambda package: str(tmp_path))
+    return lib
+
+
+@pytest.mark.parametrize('executable, debug, prefix', [
+    ('cpp_exe', True, 'gdbserver --once 127.0.0.1:3000'),
+    ('py_exe', True, f'{sys.executable} -m debugpy --listen 127.0.0.1:5678 --wait-for-client'),
+    ('cpp_exe', {'port': 3001, 'host': '0.0.0.0'}, 'gdbserver --once 0.0.0.0:3001'),
+])
+def test_debug_picks_the_debugger_and_stops_respawn_and_required(
+        tmp_path, fake_package, executable, debug, prefix):
+    config = write_config(tmp_path, {'/brain/*': {'respawn': True, 'required': True, 'debug': debug}})
+    node = ConfiguredNode(package='pkg', executable=executable, name='mode_fsm')
+    context = context_for(config, '/brain')
+
+    node._configure(context)
+
+    assert prefix_of(node, context) == prefix
+    assert perform_substitutions(context, node._ExecuteLocal__respawn) == 'false'
+    assert not node.settings.required
+
+
+@pytest.mark.parametrize('package, executable', [
+    (LaunchConfiguration('pkg'), 'cpp_exe'),
+    (None, 'LIB/cpp_exe'),
+])
+def test_debug_finds_the_executable_the_node_runs(tmp_path, fake_package, package, executable):
+    config = write_config(tmp_path, {'/brain/*': {'debug': True}})
+    executable = executable.replace('LIB', str(fake_package))
+    node = ConfiguredNode(package=package, executable=executable, name='mode_fsm')
+    context = context_for(config, '/brain')
+    context.launch_configurations['pkg'] = 'pkg'
+
+    node._configure(context)
+
+    assert prefix_of(node, context) == 'gdbserver --once 127.0.0.1:3000'
+
+
+def test_debug_of_a_missing_executable_is_refused(tmp_path):
+    config = write_config(tmp_path, {'/brain/*': {'debug': True}})
+    node = ConfiguredNode(executable=str(tmp_path / 'missing'), name='mode_fsm')
+
+    with pytest.raises(RuntimeError, match='cannot debug'):
+        node._configure(context_for(config, '/brain'))
+
+
+def test_two_nodes_cannot_wait_at_the_same_debug_address(tmp_path, fake_package):
+    config = write_config(tmp_path, {'/brain/*': {'debug': True},
+                                     '/brain/bt': {'debug': {'port': 3001}}})
+    context = context_for(config, '/brain')
+
+    ConfiguredNode(package='pkg', executable='cpp_exe', name='mode_fsm')._configure(context)
+    # the same node again, and another one on its own port, are fine
+    ConfiguredNode(package='pkg', executable='cpp_exe', name='mode_fsm')._configure(context)
+    ConfiguredNode(package='pkg', executable='cpp_exe', name='bt')._configure(context)
+
+    with pytest.raises(RuntimeError, match='/brain/other and /brain/mode_fsm both wait'):
+        ConfiguredNode(package='pkg', executable='cpp_exe', name='other')._configure(context)
+
+
+def test_debug_takes_only_port_and_host(tmp_path):
+    with pytest.raises(RuntimeError, match='takes only'):
+        load_rules(write_config(tmp_path, {'*': {'debug': {'prot': 3000}}}))
+
+
+def test_empty_debug_mapping_uses_the_defaults(tmp_path, fake_package):
+    config = write_config(tmp_path, {'/brain/*': {'debug': {}}})
+    node = ConfiguredNode(package='pkg', executable='cpp_exe', name='mode_fsm')
+    context = context_for(config, '/brain')
+
+    node._configure(context)
+
+    assert prefix_of(node, context).startswith('gdbserver --once 127.0.0.1:')

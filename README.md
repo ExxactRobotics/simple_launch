@@ -274,6 +274,7 @@ ros2 launch my_pkg system_launch.py launch_config:=dev.yaml
 | `required` | `true` shuts the whole launch down when the node exits, as `required` does in XML launch files |
 | `respawn`, `respawn_delay` | start the node again when it dies, after this many seconds. Without them, the node keeps the values of its launch file |
 | `prefix` | command the node is started with, e.g. `gdb -batch -ex run -ex bt --args` to log a backtrace when it crashes. Without it, the node keeps the prefix of its launch file, else `launch-prefix` |
+| `debug` | `true` or `{port, host}`: the node starts in `gdbserver --once` (compiled) or `debugpy --wait-for-client` (Python), each on its usual port unless `port` is given, and waits for a debugger before `main()`. Turns `respawn` and `required` off. Two nodes cannot wait on the same host and port. The host defaults to 127.0.0.1 |
 
 
 ## `OpaqueFunction` with implicit `.perform(context)`

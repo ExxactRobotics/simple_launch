@@ -19,6 +19,8 @@ node are logged when the launch shuts down, since that is how a mistyped pattern
 import fnmatch
 import os
 import re
+import shutil
+import sys
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Set, Text, Tuple
 
@@ -58,6 +60,8 @@ class NodeSettings:
     respawn_delay: Optional[float] = field(default=None, metadata={'type': (int, float)})
     # command the node is started with, e.g. 'gdb -batch -ex run -ex bt --args'
     prefix: Optional[Text] = field(default=None, metadata={'type': str})
+    # true or {port, host}: the node waits for a debugger before main(), see debug_prefix()
+    debug: object = field(default=None, metadata={'type': (bool, dict), 'keys': ('port', 'host')})
 
 
 def load_rules(path: Text) -> List[Tuple[Text, dict]]:
@@ -99,6 +103,9 @@ def check_settings(settings: dict, where: Text) -> None:
         if expected is not None and (wrong_bool or not isinstance(value, types)):
             names = '/'.join(t.__name__ for t in types)
             raise RuntimeError(f'{where}: {key} must be a {names}, not {value!r}')
+        keys = known[key].get('keys')
+        if keys is not None and isinstance(value, dict) and set(value) - set(keys):
+            raise RuntimeError(f'{where}: {key} takes only {list(keys)}, not {sorted(value)}')
         choices = known[key].get('choices')
         for choice in (value.values() if isinstance(value, dict) else [value]):
             if choices is not None and str(choice).lower() not in choices:
@@ -261,18 +268,50 @@ class NodeRespawn(Substitution):
         return perform_substitutions(context, self.__given)
 
 
+def debug_prefix(executable: Text, debug) -> Tuple[Text, Text]:
+    '''
+    Returns the prefix that makes a node wait for a debugger before main(), and the host:port
+    the debugger connects to: gdbserver for a compiled executable, debugpy for a Python one,
+    each on its usual port unless one is given. The default host keeps the port off the network.
+    The executable is the one the node runs: a path, or a name looked up on PATH.
+    '''
+    debug = debug if isinstance(debug, dict) else {}
+    path = shutil.which(executable)
+    if path is None:
+        raise RuntimeError(f'{ARG_NAME}: cannot debug {executable}, no such executable')
+    with open(path, 'rb') as f:
+        compiled = f.read(4) == b'\x7fELF'
+    address = f'{debug.get("host", "127.0.0.1")}:{debug.get("port", 3000 if compiled else 5678)}'
+    if compiled:
+        return f'gdbserver --once {address}', address
+    # the interpreter of this launch, which is the one of ROS
+    return f'{sys.executable} -m debugpy --listen {address} --wait-for-client', address
+
+
+def claim_debug_address(context: LaunchContext, address: Text, full_name: Text) -> None:
+    '''
+    Records that a node waits for its debugger at this address, and raises RuntimeError
+    if another node of the launch already does: only one of them could listen there
+    '''
+    other = launch_global(context, 'simple_launch_debug', dict).setdefault(address, full_name)
+    if other != full_name:
+        raise RuntimeError(f'{ARG_NAME}: {full_name} and {other} both wait for a debugger at '
+                           f'{address}, give one of them its own debug port')
+
+
 class ConfiguredNode(Node):
     '''
     Node whose launch settings come from the launch_config file. They are resolved when the
     node starts, because only then is its full name known (namespaces pushed by including files).
     '''
 
-    def __init__(self, *, executable, **kwargs):
+    def __init__(self, *, executable, package=None, **kwargs):
         # the settings of this node, set when it starts
         self.settings = None
         prefix = NodePrefix(self, kwargs.pop('prefix', None))
         respawn = NodeRespawn(self, kwargs.pop('respawn', False))
-        super().__init__(executable=executable, prefix=prefix, respawn=respawn, **kwargs)
+        super().__init__(executable=executable, package=package, prefix=prefix, respawn=respawn,
+                         **kwargs)
 
     def full_name(self, context: LaunchContext) -> Text:
         '''
@@ -290,6 +329,19 @@ class ConfiguredNode(Node):
         '''
         full_name = self.full_name(context)
         self.settings, patterns = settings_of(context, full_name)
+
+        # an empty {port, host} mapping asks for the defaults
+        if self.settings.debug not in (None, False):
+            # the command launch_ros runs, which finds the executable of a package as it does
+            executable = perform_substitutions(context, self.cmd[0])
+            self.settings.prefix, address = debug_prefix(executable, self.settings.debug)
+            claim_debug_address(context, address, full_name)
+            # a node stopped in a debugger must not come back by itself, and its debugger
+            # detaching must not stop the launch
+            self.settings.respawn = False
+            self.settings.required = False
+            get_logger('simple_launch').info(
+                f'{ARG_NAME}: {full_name} waits for a debugger: {self.settings.prefix}')
 
         if self.settings.respawn_delay is not None:
             # launch takes the delay as a plain number at construction only, so it is replaced
