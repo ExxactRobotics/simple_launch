@@ -12,6 +12,7 @@ from .simple_substitution import SimpleSubstitution, flatten
 from .group import Group
 from . import console
 from .gazebo import only_show_args, silent_exec, GazeboBridge, ros_gz_prefix, gz_launch_setup
+from .param_overrides import MergedOverrides
 from typing import Text, List, Iterable, Tuple, Union
 
 NODE_REMAPS = LAUNCH_ARGS = 1
@@ -391,6 +392,17 @@ class SimpleLauncher:
             else:
                 node_args['parameters'] = [{'use_sim_time': self.sim_time}]
 
+        # override files go last so that they win over the node's own parameters
+        params = node_args.get('parameters')
+        if params is None:
+            params = []
+        elif isinstance(params, (list, tuple)):
+            params = list(params)
+        else:
+            params = [params]
+        overrides = MergedOverrides()
+        node_args['parameters'] = params + [overrides]
+
         if as_composable:
             # check plugin name - add package if needed
             if '::' not in plugin:
@@ -398,7 +410,9 @@ class SimpleLauncher:
             return self.add_action(ComposableNode(package=package, plugin=plugin, **node_args))
 
         # basic node
-        return self.add_action(Node(package=package, executable=executable, **node_args))
+        node = Node(package=package, executable=executable, **node_args)
+        overrides.node = node
+        return self.add_action(node)
 
     def log_info(self, msg):
         '''

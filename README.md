@@ -224,6 +224,24 @@ The current `use_sim_time` setting can be retrieved through `sl.sim_time` that m
 In all cases, if the `use_sim_time` parameter is explicitely given to a node, it will be used instead of the `SimpleLauncher` instance one.
 
 
+## Parameter override files
+
+Every node created with `sl.node` reads the `param_overrides` launch argument: a space-separated list of YAML parameter files that it loads after its own parameters.
+
+```bash
+ros2 launch my_pkg system_launch.py param_overrides:="fleet.yaml robot.yaml local.yaml"
+```
+
+- The files are merged in order, so a later file wins over an earlier one, and the result wins over the parameters given in the launch files.
+- Every top-level key must be `/**` or `/**/<node>`, with no namespace, so that a file applies under any namespace.
+- A missing file or a wrong key stops the launch. The files are read once per launch, and each node's share is written to the launch log directory, its path logged at debug level. Nodes with nothing to override share one empty file.
+- `SimpleLauncher` does not declare the argument, so that an included file cannot hide the default of the file that includes it. Declare it in the top-level launch file to give it a default or show it with `--show-args`:
+
+```python
+sl.declare_arg('param_overrides', default_value = sl.find('my_pkg', 'overrides.yaml'))
+```
+
+
 ## `OpaqueFunction` with implicit `.perform(context)`
 
 Most of the use cases can be dealt with substitutions and `with sl.group` blocks.
