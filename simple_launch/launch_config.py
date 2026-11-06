@@ -18,10 +18,13 @@ node are logged when the launch shuts down, since that is how a mistyped pattern
 
 import fnmatch
 import os
+import re
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Set, Text, Tuple
 
-from launch.event_handlers import OnShutdown
+from launch import Substitution
+from launch.actions import Shutdown
+from launch.event_handlers import OnProcessExit, OnShutdown
 from launch.conditions import evaluate_condition_expression
 from launch.launch_context import LaunchContext
 from launch.logging import get_logger
@@ -46,6 +49,15 @@ class NodeSettings:
 
     # a level for the whole process, or {logger: level} where 'default' is the whole process
     log_level: object = field(default=None, metadata={'type': (str, dict), 'choices': LOG_LEVELS})
+    # false leaves the node out of the launch
+    enabled: bool = field(default=True, metadata={'type': bool})
+    # true shuts the whole launch down when the node exits
+    required: bool = field(default=False, metadata={'type': bool})
+    # true starts the node again when it dies, after respawn_delay seconds
+    respawn: Optional[bool] = field(default=None, metadata={'type': bool})
+    respawn_delay: Optional[float] = field(default=None, metadata={'type': (int, float)})
+    # command the node is started with, e.g. 'gdb -batch -ex run -ex bt --args'
+    prefix: Optional[Text] = field(default=None, metadata={'type': str})
 
 
 def load_rules(path: Text) -> List[Tuple[Text, dict]]:
@@ -82,7 +94,9 @@ def check_settings(settings: dict, where: Text) -> None:
     for key, value in settings.items():
         expected = known[key].get('type')
         types = expected if isinstance(expected, tuple) else (expected,)
-        if expected is not None and not isinstance(value, types):
+        # YAML true is also an int, but no number setting takes it
+        wrong_bool = isinstance(value, bool) and bool not in types
+        if expected is not None and (wrong_bool or not isinstance(value, types)):
             names = '/'.join(t.__name__ for t in types)
             raise RuntimeError(f'{where}: {key} must be a {names}, not {value!r}')
         choices = known[key].get('choices')
@@ -198,6 +212,55 @@ def log_args(settings: NodeSettings, logger: Optional[Text] = None) -> List[List
     return [[TextSubstitution(text=arg)] for arg in args]
 
 
+class NodePrefix(Substitution):
+    '''
+    Prefix of a ConfiguredNode: the one of its settings, else the one its launch file gives,
+    else the launch-prefix launch configuration filtered by launch-prefix-filter, as launch does
+    '''
+
+    def __init__(self, node, given):
+        super().__init__()
+        self.__node = node
+        self.__given = None if given is None else normalize_to_list_of_substitutions(given)
+
+    def describe(self) -> Text:
+        return 'NodePrefix()'
+
+    def perform(self, context: LaunchContext) -> Text:
+        settings = self.__node.settings
+        if settings is not None and settings.prefix:
+            return settings.prefix
+        if self.__given is not None:
+            return perform_substitutions(context, self.__given)
+        prefix_filter = context.launch_configurations.get('launch-prefix-filter', '')
+        executable = os.path.basename(perform_substitutions(
+            context, normalize_to_list_of_substitutions(self.__node.node_executable)))
+        if prefix_filter and re.match(prefix_filter, executable) is None:
+            return ''
+        return context.launch_configurations.get('launch-prefix', '')
+
+
+class NodeRespawn(Substitution):
+    '''
+    Respawn flag of a ConfiguredNode: the one of its settings, else the one its launch file gives
+    '''
+
+    def __init__(self, node, given):
+        super().__init__()
+        self.__node = node
+        self.__given = normalize_to_list_of_substitutions(
+            str(given).lower() if isinstance(given, bool) else given)
+
+    def describe(self) -> Text:
+        return 'NodeRespawn()'
+
+    def perform(self, context: LaunchContext) -> Text:
+        settings = self.__node.settings
+        if settings is not None and settings.respawn is not None:
+            return str(settings.respawn).lower()
+        return perform_substitutions(context, self.__given)
+
+
 class ConfiguredNode(Node):
     '''
     Node whose launch settings come from the launch_config file. They are resolved when the
@@ -205,9 +268,11 @@ class ConfiguredNode(Node):
     '''
 
     def __init__(self, *, executable, **kwargs):
-        super().__init__(executable=executable, **kwargs)
         # the settings of this node, set when it starts
         self.settings = None
+        prefix = NodePrefix(self, kwargs.pop('prefix', None))
+        respawn = NodeRespawn(self, kwargs.pop('respawn', False))
+        super().__init__(executable=executable, prefix=prefix, respawn=respawn, **kwargs)
 
     def full_name(self, context: LaunchContext) -> Text:
         '''
@@ -226,6 +291,13 @@ class ConfiguredNode(Node):
         full_name = self.full_name(context)
         self.settings, patterns = settings_of(context, full_name)
 
+        if self.settings.respawn_delay is not None:
+            # launch takes the delay as a plain number at construction only, so it is replaced
+            # in place, and an attribute that launch renamed must not be silently ignored
+            if not hasattr(self, '_ExecuteLocal__respawn_delay'):
+                raise RuntimeError(f'{ARG_NAME}: this version of launch cannot set respawn_delay')
+            self._ExecuteLocal__respawn_delay = float(self.settings.respawn_delay)
+
         # given after the node's own arguments, so that it wins over them
         self.cmd.extend(log_args(self.settings))
         return full_name, patterns
@@ -234,4 +306,17 @@ class ConfiguredNode(Node):
         full_name, patterns = self._configure(context)
         if log_summary(context, describe(full_name, self.settings, patterns)):
             return None
+        if not self.settings.enabled:
+            get_logger('simple_launch').info(f'{ARG_NAME}: {full_name} not started, enabled is false')
+            return None
+        self._supervise(context, full_name)
         return super().execute(context)
+
+    def _supervise(self, context: LaunchContext, full_name: Text) -> None:
+        '''
+        Shuts the launch down when this node exits, if its settings say it is required
+        '''
+        if self.settings.required:
+            reason = f'{full_name} exited and is required'
+            context.register_event_handler(OnProcessExit(
+                target_action=self, on_exit=[Shutdown(reason=reason)]))

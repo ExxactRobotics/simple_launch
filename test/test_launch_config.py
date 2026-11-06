@@ -6,6 +6,7 @@ Run with: python3 -m pytest test/test_launch_config.py
 import pytest
 import yaml
 from launch import LaunchContext
+from launch.event_handlers import OnProcessExit
 from launch.utilities import perform_substitutions
 
 from simple_launch import SimpleLauncher
@@ -196,3 +197,108 @@ def test_describe_lists_the_changed_settings_and_the_rules(tmp_path):
     assert describe('/brain/mode_fsm', *resolve(rules, '/brain/mode_fsm')) == \
         "/brain/mode_fsm: log_level='debug' (rules: *, /brain/*)"
     assert describe('/a', *resolve([], '/a')) == '/a: defaults (rules: none)'
+
+
+def prefix_of(node, context):
+    return perform_substitutions(context, node.process_description.prefix)
+
+
+def test_prefix_of_the_settings_wins(tmp_path):
+    config = write_config(tmp_path, {'/navigation/ctrl': {'prefix': 'gdb -batch -ex run -ex bt --args'}})
+    node = ConfiguredNode(package='pkg', executable='exe', name='ctrl', prefix='valgrind')
+    context = context_for(config, '/navigation')
+
+    node._configure(context)
+
+    assert prefix_of(node, context) == 'gdb -batch -ex run -ex bt --args'
+
+
+def test_prefix_falls_back_to_the_launch_file_then_launch_prefix(tmp_path):
+    config = write_config(tmp_path, {'/other': {'prefix': 'perf record'}})
+    context = context_for(config, '/navigation')
+    context.launch_configurations['launch-prefix'] = 'xterm -e'
+
+    given = ConfiguredNode(package='pkg', executable='exe', name='ctrl', prefix='valgrind')
+    given._configure(context)
+    assert prefix_of(given, context) == 'valgrind'
+
+    plain = ConfiguredNode(package='pkg', executable='exe', name='ctrl')
+    plain._configure(context)
+    assert prefix_of(plain, context) == 'xterm -e'
+
+    context.launch_configurations['launch-prefix-filter'] = 'other_exe'
+    assert prefix_of(plain, context) == ''
+
+
+def test_disabled_node_is_not_started(tmp_path):
+    config = write_config(tmp_path, {'/navigation/*': {'enabled': False}})
+    node = ConfiguredNode(package='pkg', executable='exe', name='ctrl')
+    context = context_for(config, '/navigation')
+
+    assert node.execute(context) is None
+    assert node.process_details is None
+    assert not node.settings.enabled
+
+
+def test_enabled_must_be_a_boolean(tmp_path):
+    with pytest.raises(RuntimeError, match='must be a bool'):
+        load_rules(write_config(tmp_path, {'*': {'enabled': 'no'}}))
+
+
+@pytest.mark.parametrize('required', [True, False])
+def test_required_node_shuts_the_launch_down(tmp_path, required):
+    config = write_config(tmp_path, {'/brain/*': {'required': required}})
+    node = ConfiguredNode(package='pkg', executable='exe', name='mode_fsm')
+    context = context_for(config, '/brain')
+
+    full_name, _ = node._configure(context)
+    node._supervise(context, full_name)
+
+    handlers = [h for h in context._event_handlers if isinstance(h, OnProcessExit)]
+    assert len(handlers) == (1 if required else 0)
+
+
+@pytest.mark.parametrize('given, rule, expected', [
+    (False, {'respawn': True}, 'true'),
+    (True, {'respawn': False}, 'false'),
+    (True, {}, 'true'),
+    (False, {}, 'false'),
+])
+def test_respawn_of_the_settings_wins(tmp_path, given, rule, expected):
+    config = write_config(tmp_path, {'/sensing/*': rule})
+    node = ConfiguredNode(package='pkg', executable='exe', name='camera', respawn=given)
+    context = context_for(config, '/sensing')
+
+    node._configure(context)
+
+    # launch keeps the flag as a list of substitutions until the node starts
+    assert perform_substitutions(context, node._ExecuteLocal__respawn) == expected
+
+
+def test_respawn_delay_is_set(tmp_path):
+    config = write_config(tmp_path, {'/sensing/*': {'respawn': True, 'respawn_delay': 2}})
+    node = ConfiguredNode(package='pkg', executable='exe', name='camera', respawn_delay=0.5)
+    context = context_for(config, '/sensing')
+
+    node._configure(context)
+
+    assert node._ExecuteLocal__respawn_delay == 2.0
+
+
+def test_respawn_delay_stops_the_launch_if_launch_renamed_it(tmp_path):
+    config = write_config(tmp_path, {'/sensing/*': {'respawn_delay': 2}})
+    node = ConfiguredNode(package='pkg', executable='exe', name='camera')
+    del node._ExecuteLocal__respawn_delay
+
+    with pytest.raises(RuntimeError, match='cannot set respawn_delay'):
+        node._configure(context_for(config, '/sensing'))
+
+
+def test_respawn_delay_must_be_a_number(tmp_path):
+    with pytest.raises(RuntimeError, match='must be a int/float'):
+        load_rules(write_config(tmp_path, {'*': {'respawn_delay': 'soon'}}))
+
+
+def test_respawn_delay_refuses_a_boolean(tmp_path):
+    with pytest.raises(RuntimeError, match='must be a int/float'):
+        load_rules(write_config(tmp_path, {'*': {'respawn_delay': True}}))
