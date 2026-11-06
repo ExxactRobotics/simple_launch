@@ -13,6 +13,7 @@ from .group import Group
 from . import console
 from .gazebo import only_show_args, silent_exec, GazeboBridge, ros_gz_prefix, gz_launch_setup
 from .param_overrides import MergedOverrides
+from .launch_config import ConfiguredNode
 from typing import Text, List, Iterable, Tuple, Union
 
 NODE_REMAPS = LAUNCH_ARGS = 1
@@ -409,8 +410,8 @@ class SimpleLauncher:
                 plugin = '{}::{}'.format(package, plugin)
             return self.add_action(ComposableNode(package=package, plugin=plugin, **node_args))
 
-        # basic node
-        node = Node(package=package, executable=executable, **node_args)
+        # basic node, with the settings of the launch_config file
+        node = ConfiguredNode(package=package, executable=executable, **node_args)
         overrides.node = node
         return self.add_action(node)
 

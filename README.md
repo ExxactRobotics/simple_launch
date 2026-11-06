@@ -242,6 +242,36 @@ sl.declare_arg('param_overrides', default_value = sl.find('my_pkg', 'overrides.y
 ```
 
 
+## Launch settings file
+
+The `launch_config` launch argument names a YAML file of launch settings for the nodes created with `sl.node`. It maps patterns on the full node name to settings:
+
+```yaml
+nodes:
+  '*':
+    log_level: info
+  /navigation/*:
+    log_level: debug
+  /navigation/controller_server:
+    log_level: error
+```
+
+```bash
+ros2 launch my_pkg system_launch.py launch_config:=dev.yaml
+```
+
+- Patterns are `fnmatch` patterns, where `*` also matches `/`. A node given no name is matched by its executable name.
+- Rules apply from top to bottom, and for each setting the last rule that matches and names it wins: put the catch-all first, then groups, then single nodes.
+- The settings are resolved when the node starts, so the namespaces pushed by including files are part of its name.
+- Like `param_overrides`, the argument is not declared by `SimpleLauncher`: declare it in the top-level file to give it a default.
+- `dry_run:=true` logs the settings each node created with `sl.node` would get and the rules that gave them, and starts none of them. Processes started otherwise still start: included launch files that do not use `SimpleLauncher`, and `ExecuteProcess` actions.
+- An unknown setting or a value of the wrong type stops the launch. A rule that matched no node, often a mistyped pattern, is logged when the launch shuts down.
+
+| Setting | Effect |
+|---|---|
+| `log_level` | default level of the node's process, given after the node's own arguments so that it wins over a default level set in the launch file. Also takes a mapping of logger names to levels, `default` being the process: `{default: info, rcl: error}` |
+
+
 ## `OpaqueFunction` with implicit `.perform(context)`
 
 Most of the use cases can be dealt with substitutions and `with sl.group` blocks.
