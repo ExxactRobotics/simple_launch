@@ -134,12 +134,61 @@ def test_nodes_with_nothing_to_override_share_one_file(tmp_path, monkeypatch):
     assert len(list((tmp_path / 'log').iterdir())) == 3
 
 
-def test_launcher_does_not_declare_the_argument():
-    # an included file must not hide the default given by the file that includes it
-    actions = SimpleLauncher(use_sim_time=False).launch_description().entities
+FILE_ARGS = ['param_overrides', 'launch_config']
 
-    assert not [action for action in actions
-                if isinstance(action, DeclareLaunchArgument) and action.name == 'param_overrides']
+
+def declarations(actions, name):
+    return [action for action in actions
+            if isinstance(action, DeclareLaunchArgument) and action.name == name]
+
+
+def value_after(actions, context, name):
+    # runs the declarations of a description in order, as the launch does
+    for action in declarations(actions, name):
+        action.execute(context)
+    return context.launch_configurations[name]
+
+
+@pytest.mark.parametrize('name', FILE_ARGS)
+@pytest.mark.parametrize('opaque', [False, True])
+def test_launcher_declares_the_file_arguments_first_with_no_default(name, opaque):
+    sl = SimpleLauncher(use_sim_time=False)
+    sl.node('pkg', 'exe')
+    if opaque:
+        actions = sl.launch_description(opaque_function=lambda: [])().entities
+    else:
+        actions = sl.launch_description().entities
+
+    declared = declarations(actions, name)
+    assert len(declared) == 1
+    assert actions.index(declared[0]) < len(FILE_ARGS)
+    assert value_after(actions, LaunchContext(), name) == ''
+
+
+@pytest.mark.parametrize('name', FILE_ARGS)
+def test_given_value_wins_over_the_empty_default(name):
+    # a value from the command line or from the including file is set before this file runs
+    context = LaunchContext()
+    context.launch_configurations[name] = 'site.yaml'
+
+    assert value_after(SimpleLauncher().launch_description().entities, context, name) == 'site.yaml'
+
+
+@pytest.mark.parametrize('name', FILE_ARGS)
+def test_own_declaration_is_kept_and_moved_first(name):
+    sl = SimpleLauncher(use_sim_time=False)
+    sl.node('pkg', 'exe')
+    sl.declare_arg(name, default_value='site.yaml')
+    actions = sl.launch_description().entities
+
+    declared = declarations(actions, name)
+    assert len(declared) == 1
+    assert actions.index(declared[0]) < len(FILE_ARGS)
+
+    # the empty default of an included file runs later and changes nothing
+    included = SimpleLauncher().launch_description().entities
+    context = LaunchContext()
+    assert value_after(actions + included, context, name) == 'site.yaml'
 
 
 def test_named_node_gets_its_sections_under_its_full_name():
