@@ -224,6 +224,73 @@ The current `use_sim_time` setting can be retrieved through `sl.sim_time` that m
 In all cases, if the `use_sim_time` parameter is explicitely given to a node, it will be used instead of the `SimpleLauncher` instance one.
 
 
+## Parameter override files
+
+Every node created with `sl.node` reads the `param_overrides` launch argument: a space-separated list of YAML parameter files that it loads after its own parameters.
+
+```bash
+ros2 launch my_pkg system_launch.py param_overrides:="fleet.yaml robot.yaml local.yaml"
+```
+
+- The files are merged in order, so a later file wins over an earlier one, and the result wins over the parameters given in the launch files.
+- Every top-level key must be `/**` or `/**/<node>`, with no namespace, so that a file applies under any namespace.
+- A missing file or a wrong key stops the launch. The files are read once per launch, and each node's share is written to the launch log directory, its path logged at debug level. Nodes with nothing to override share one empty file.
+- Every launch file created with `SimpleLauncher` declares the argument with an empty default, so that `--show-args` lists it. To give it a default, declare it in the top-level launch file. `SimpleLauncher` puts that declaration first in the file, and since the first declaration to run sets the value, it wins over the empty default of the files it includes:
+
+```python
+sl.declare_arg('param_overrides', default_value = sl.find('my_pkg', 'overrides.yaml'))
+```
+
+
+## Launch settings file
+
+The `launch_config` launch argument names a YAML file of launch settings for the nodes created with `sl.node`. It maps patterns on the full node name to settings:
+
+```yaml
+nodes:
+  /**:
+    log_level: info
+  /navigation/**:
+    log_level: debug
+  /navigation/controller_server:
+    log_level: error
+```
+
+```bash
+ros2 launch my_pkg system_launch.py launch_config:=dev.yaml
+```
+
+- Patterns are written as the node keys of a ROS parameter file, and select the same nodes: `/**` matches any number of namespaces, `*` any characters within one name, and a key without a leading `/` starts at the root namespace. Keys can also be nested as in a parameter file, so the file above can also be written:
+
+  ```yaml
+  nodes:
+    /**:
+      log_level: info
+    /navigation:
+      '**':           # quoted, YAML reads a key starting with * as an alias
+        log_level: debug
+      controller_server:
+        log_level: error
+  ```
+
+  A node given no name is matched by its executable name. A node named like a setting, such as `debug`, is written in the flat form.
+- Rules apply from top to bottom, and for each setting the last rule that matches and names it wins: put the catch-all first, then groups, then single nodes.
+- The settings are resolved when the node starts, so the namespaces pushed by including files are part of its name.
+- Like `param_overrides`, the argument is declared with an empty default by every launch file created with `SimpleLauncher`: declare it in the top-level file to give it a default.
+- `dry_run:=true` logs the settings each node created with `sl.node` would get and the rules that gave them, and starts none of them. Processes started otherwise still start: included launch files that do not use `SimpleLauncher`, and `ExecuteProcess` actions.
+- In a container created with `sl.container`, each component is matched by its own full name (its plugin class name when it has no name). `enabled` and `log_level` act on the component, `log_level` only when the component has a name, since its logger is otherwise named by its constructor; the settings that act on a process (`prefix`, `required`, `respawn`, `debug`) apply to the container only. Components loaded with `existing=True` go into a process started elsewhere: only `enabled` applies, and a `log_level` is warned about.
+- An unknown setting or a value of the wrong type stops the launch. A rule that matched no node, often a mistyped pattern, is logged when the launch shuts down.
+
+| Setting | Effect |
+|---|---|
+| `log_level` | default level of the node's process, given after the node's own arguments so that it wins over a default level set in the launch file. A component in a container gets the level of its own logger instead. Also takes a mapping of logger names to levels, `default` being the process: `{default: info, rcl: error}` |
+| `enabled` | `false` leaves the node out of the launch, e.g. to run it from a debugger while the rest of the system runs |
+| `required` | `true` shuts the whole launch down when the node exits, as `required` does in XML launch files |
+| `respawn`, `respawn_delay` | start the node again when it dies, after this many seconds. Without them, the node keeps the values of its launch file |
+| `prefix` | command the node is started with, e.g. `gdb -batch -ex run -ex bt --args` to log a backtrace when it crashes. Without it, the node keeps the prefix of its launch file, else `launch-prefix` |
+| `debug` | `true` or `{port, host}`: the node starts in `gdbserver --once` (compiled) or `debugpy --wait-for-client` (Python), each on its usual port unless `port` is given, and waits for a debugger before `main()`. Turns `respawn` and `required` off. Two nodes cannot wait on the same host and port. The host defaults to 127.0.0.1 |
+
+
 ## `OpaqueFunction` with implicit `.perform(context)`
 
 Most of the use cases can be dealt with substitutions and `with sl.group` blocks.

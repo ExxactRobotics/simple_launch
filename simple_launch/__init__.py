@@ -12,11 +12,34 @@ from .simple_substitution import SimpleSubstitution, flatten
 from .group import Group
 from . import console
 from .gazebo import only_show_args, silent_exec, GazeboBridge, ros_gz_prefix, gz_launch_setup
+from .param_overrides import MergedOverrides, ARG_NAME as PARAM_OVERRIDES_ARG
+from .launch_config import (ComponentEnabled, ConfiguredContainer, ConfiguredLoad, ConfiguredNode,
+                            ARG_NAME as LAUNCH_CONFIG_ARG)
 from typing import Text, List, Iterable, Tuple, Union
 
 NODE_REMAPS = LAUNCH_ARGS = 1
 NODE_PARAMS = 2
 XACRO_ARGS = 3
+
+# Launch arguments read by every node created with sl.node, with their descriptions
+FILE_ARGS = {
+    PARAM_OVERRIDES_ARG: 'Space-separated YAML parameter files applied over the parameters of every node',
+    LAUNCH_CONFIG_ARG: 'YAML file of launch settings for the nodes, such as their log level',
+}
+
+
+def with_file_arguments(actions: list) -> list:
+    '''
+    Returns the actions with the declarations of the FILE_ARGS arguments first, adding an empty
+    default for those this file does not declare.
+    A declaration sets its default only while the value is unset, so the first one to run wins.
+    Running first, the declaration of this file wins over those of the files it includes.
+    '''
+    own = {action.name: action for action in actions
+           if isinstance(action, DeclareLaunchArgument) and action.name in FILE_ARGS}
+    first = [own.get(name) or DeclareLaunchArgument(name, default_value='', description=description)
+             for name, description in FILE_ARGS.items()]
+    return first + [action for action in actions if action not in own.values()]
 
 
 def stringify(arg):
@@ -171,7 +194,9 @@ class SimpleLauncher:
         if opaque_function is None:
             # classical call without opaque function
             main_actions = self.__cur_group.close()
-            return main_actions if self.__has_context() else LaunchDescription(main_actions)
+            if self.__has_context():
+                return main_actions
+            return LaunchDescription(with_file_arguments(main_actions))
 
         if self.__has_context():
             # opaque function but we already have context
@@ -185,7 +210,8 @@ class SimpleLauncher:
                 self.__context = context
                 return opaque_function()
 
-            return LaunchDescription(self.__cur_group.close() + [OpaqueFunction(function = wrapped_opaque_function)])
+            return LaunchDescription(with_file_arguments(self.__cur_group.close())
+                                     + [OpaqueFunction(function = wrapped_opaque_function)])
 
         return generate_launch_description
 
@@ -327,12 +353,12 @@ class SimpleLauncher:
             # store ComposableNodes inside a Container
             if existing:
                 self.add_action(
-                    LoadComposableNodes(
+                    ConfiguredLoad(
                         composable_node_descriptions = composed,
                         target_container=name))
             else:
                 self.add_action(
-                    ComposableNodeContainer(
+                    ConfiguredContainer(
                         name=name,
                         namespace=namespace,
                         package=package,
@@ -391,14 +417,31 @@ class SimpleLauncher:
             else:
                 node_args['parameters'] = [{'use_sim_time': self.sim_time}]
 
+        # override files go last so that they win over the node's own parameters
+        params = node_args.get('parameters')
+        if params is None:
+            params = []
+        elif isinstance(params, (list, tuple)):
+            params = list(params)
+        else:
+            params = [params]
+        overrides = MergedOverrides()
+        node_args['parameters'] = params + [overrides]
+
         if as_composable:
             # check plugin name - add package if needed
             if '::' not in plugin:
                 plugin = '{}::{}'.format(package, plugin)
-            return self.add_action(ComposableNode(package=package, plugin=plugin, **node_args))
+            # its enabled setting is checked when the container loads it
+            condition = ComponentEnabled(node_args.pop('condition', None))
+            component = ComposableNode(package=package, plugin=plugin, condition=condition, **node_args)
+            condition.description = component
+            return self.add_action(component)
 
-        # basic node
-        return self.add_action(Node(package=package, executable=executable, **node_args))
+        # basic node, with the settings of the launch_config file
+        node = ConfiguredNode(package=package, executable=executable, **node_args)
+        overrides.node = node
+        return self.add_action(node)
 
     def log_info(self, msg):
         '''
