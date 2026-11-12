@@ -1,13 +1,15 @@
 '''
 Launch settings of the nodes, read from the YAML file given by the launch_config launch argument.
 
-The file maps patterns on the full node name (fnmatch, where * also matches /) to settings:
+The file maps patterns on the full node name to settings, written and nested as the node keys of
+a ROS parameter file ('/**' any number of namespaces, '*' within one name):
 
     nodes:
-      '*':
+      /**:
         log_level: info
-      /navigation/*:
-        log_level: debug
+      /navigation:
+        '**':
+          log_level: debug
 
 Rules apply from top to bottom. For each setting, the last rule that matches the node and
 names that setting wins: put the catch-all first, then groups, then single nodes.
@@ -16,7 +18,7 @@ An unknown setting or a value of the wrong type stops the launch. The rules that
 node are logged when the launch shuts down, since that is how a mistyped pattern shows.
 '''
 
-import fnmatch
+import functools
 import os
 import re
 import shutil
@@ -81,13 +83,66 @@ def load_rules(path: Text) -> List[Tuple[Text, dict]]:
     if unknown:
         raise RuntimeError(f'{ARG_NAME}: {path} has top-level keys {unknown}, only "nodes" is known')
     nodes = content.get('nodes') or {}
-    if not isinstance(nodes, dict) or not all(isinstance(s, dict) for s in nodes.values()):
+    if not isinstance(nodes, dict):
         raise RuntimeError(f'{ARG_NAME}: {path} must map "nodes" to pattern: settings entries')
 
-    rules = [(str(pattern), settings) for pattern, settings in nodes.items()]
+    rules = flatten_rules('', nodes, f'{ARG_NAME}: {path}')
     for pattern, settings in rules:
-        check_settings(settings, f'{ARG_NAME}: {path}, rule {pattern!r}')
+        where = f'{ARG_NAME}: {path}, rule {pattern!r}'
+        try:
+            pattern_regex(pattern)
+        except ValueError as error:
+            raise RuntimeError(f'{where}: {error}') from None
+        check_settings(settings, where)
     return rules
+
+
+def flatten_rules(parent: Text, entries: dict, where: Text) -> List[Tuple[Text, dict]]:
+    '''
+    Returns the (pattern, settings) rules of possibly nested pattern entries, in file order.
+    In an entry, a key that is not a setting and maps to a mapping is a child pattern, joined to
+    its parent with a '/'. The entry's own settings come before its children, so they win over it.
+    An entry made only of children is a grouping and gives no rule of its own.
+    '''
+    known = {f.name for f in fields(NodeSettings)}
+    rules = []
+    for key, value in entries.items():
+        pattern = join_pattern(parent, str(key))
+        if not isinstance(value, dict):
+            raise RuntimeError(f'{where}: rule {pattern!r} is not a pattern: settings entry')
+        settings = {k: v for k, v in value.items() if k in known or not isinstance(v, dict)}
+        children = {k: v for k, v in value.items() if k not in settings}
+        if settings or not children:
+            rules.append((pattern, settings))
+        rules += flatten_rules(pattern, children, where)
+    return rules
+
+
+def join_pattern(parent: Text, child: Text) -> Text:
+    '''
+    Returns a child pattern under its parent one, with a single '/' between them.
+    Without a parent, the child gets the leading '/' of the root namespace.
+    '''
+    return f'{parent.rstrip("/")}/{child.lstrip("/")}'
+
+
+@functools.lru_cache(maxsize=None)
+def pattern_regex(pattern: Text) -> 're.Pattern':
+    '''
+    Returns the regex of a node name pattern, read as a node key of a ROS parameter file:
+    '/**' matches zero or more names, '*' any characters within one name and '?' one of them.
+    Raises ValueError on a '**' that is not a whole name, which ROS does not define.
+    '''
+    parts = []
+    for name in pattern.lstrip('/').split('/'):
+        if name == '**':
+            parts.append('(?:/[^/]+)*')
+        elif '**' in name:
+            raise ValueError(f"'**' must be a whole name, as in '/**/node', not {name!r}")
+        else:
+            wildcards = {'*': '[^/]*', '?': '[^/]'}
+            parts.append('/' + ''.join(wildcards.get(c) or re.escape(c) for c in name))
+    return re.compile(''.join(parts))
 
 
 def check_settings(settings: dict, where: Text) -> None:
@@ -149,7 +204,7 @@ def resolve(rules: List[Tuple[Text, dict]], full_name: Text) -> Tuple[NodeSettin
     settings = NodeSettings()
     patterns = []
     for pattern, values in rules:
-        if fnmatch.fnmatchcase(full_name, pattern):
+        if pattern_regex(pattern).fullmatch(full_name):
             patterns.append(pattern)
             for key, value in values.items():
                 setattr(settings, key, value)

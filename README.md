@@ -248,9 +248,9 @@ The `launch_config` launch argument names a YAML file of launch settings for the
 
 ```yaml
 nodes:
-  '*':
+  /**:
     log_level: info
-  /navigation/*:
+  /navigation/**:
     log_level: debug
   /navigation/controller_server:
     log_level: error
@@ -260,7 +260,20 @@ nodes:
 ros2 launch my_pkg system_launch.py launch_config:=dev.yaml
 ```
 
-- Patterns are `fnmatch` patterns, where `*` also matches `/`. A node given no name is matched by its executable name.
+- Patterns are written as the node keys of a ROS parameter file, and select the same nodes: `/**` matches any number of namespaces, `*` any characters within one name, and a key without a leading `/` starts at the root namespace. Keys can also be nested as in a parameter file, so the file above can also be written:
+
+  ```yaml
+  nodes:
+    /**:
+      log_level: info
+    /navigation:
+      '**':           # quoted, YAML reads a key starting with * as an alias
+        log_level: debug
+      controller_server:
+        log_level: error
+  ```
+
+  A node given no name is matched by its executable name. A node named like a setting, such as `debug`, is written in the flat form.
 - Rules apply from top to bottom, and for each setting the last rule that matches and names it wins: put the catch-all first, then groups, then single nodes.
 - The settings are resolved when the node starts, so the namespaces pushed by including files are part of its name.
 - Like `param_overrides`, the argument is declared with an empty default by every launch file created with `SimpleLauncher`: declare it in the top-level file to give it a default.

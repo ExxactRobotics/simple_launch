@@ -41,7 +41,7 @@ def command(node, context):
 
 def test_last_matching_rule_wins_per_setting(tmp_path):
     rules = load_rules(write_config(tmp_path, {
-        '*': {'log_level': 'info'},
+        '/**': {'log_level': 'info'},
         '/navigation/*': {'log_level': 'debug'},
         '/navigation/planner_server': {},
     }))
@@ -51,7 +51,95 @@ def test_last_matching_rule_wins_per_setting(tmp_path):
     # a rule that names no setting keeps the earlier values
     planner, patterns = resolve(rules, '/navigation/planner_server')
     assert planner.log_level == 'debug'
-    assert patterns == ['*', '/navigation/*', '/navigation/planner_server']
+    assert patterns == ['/**', '/navigation/*', '/navigation/planner_server']
+
+
+def test_nested_patterns_give_the_flat_rules(tmp_path):
+    flat = load_rules(write_config(tmp_path, {
+        '/**': {'log_level': 'info'},
+        '/navigation/**': {'log_level': 'debug'},
+        '/navigation/controller_server': {'log_level': 'error', 'respawn': True},
+    }, name='flat.yaml'))
+    nested = load_rules(write_config(tmp_path, {
+        '**': {'log_level': 'info'},
+        '/navigation/': {
+            '**': {'log_level': 'debug'},
+            '/controller_server': {'log_level': 'error', 'respawn': True},
+        },
+    }, name='nested.yaml'))
+
+    # the grouping entry gives no rule, so it is never reported as matching no node
+    assert nested == flat
+
+
+def test_patterns_nest_at_any_depth(tmp_path):
+    rules = load_rules(write_config(tmp_path, {
+        '/namespace': {
+            'subnamespace': {
+                'nodea': {'log_level': 'debug'},
+                'nodeb': {'enabled': False},
+            },
+        },
+    }))
+
+    assert rules == [('/namespace/subnamespace/nodea', {'log_level': 'debug'}),
+                     ('/namespace/subnamespace/nodeb', {'enabled': False})]
+    assert resolve(rules, '/namespace/subnamespace/nodea')[0].log_level == 'debug'
+
+
+def test_entry_settings_come_before_its_children(tmp_path):
+    rules = load_rules(write_config(tmp_path, {
+        'a': {'b': {'log_level': 'warn'}, 'log_level': 'debug', 'enabled': False},
+    }))
+
+    assert rules == [('/a', {'log_level': 'debug', 'enabled': False}),
+                     ('/a/b', {'log_level': 'warn'})]
+    assert resolve(rules, '/a/b')[0].log_level == 'warn'
+    assert resolve(rules, '/a')[0].log_level == 'debug'
+
+
+def test_setting_mappings_are_not_child_patterns(tmp_path):
+    rules = load_rules(write_config(tmp_path, {
+        '/a': {'log_level': {'default': 'info', 'rcl': 'error'}, 'debug': {'port': 3000}},
+    }))
+
+    assert rules == [('/a', {'log_level': {'default': 'info', 'rcl': 'error'},
+                             'debug': {'port': 3000}})]
+
+
+@pytest.mark.parametrize('nodes, message', [
+    ({'/a': {'b': {'log_levle': 'debug'}}}, r"rule '/a/b': unknown settings \['log_levle'\]"),
+    ({'/a': {'b': {'c': 'debug'}}}, r"rule '/a/b': unknown settings \['c'\]"),
+    ({'/a': {'b': {'log_level': 'loud'}}}, 'must be one of'),
+])
+def test_nested_mistakes_are_refused(tmp_path, nodes, message):
+    with pytest.raises(RuntimeError, match=message):
+        load_rules(write_config(tmp_path, nodes))
+
+
+@pytest.mark.parametrize('pattern, matches, misses', [
+    ('/**', ['/a', '/a/b/c'], []),
+    ('/**/node', ['/node', '/a/node', '/a/b/node'], ['/a/node2', '/anode']),
+    ('/a/*', ['/a/b'], ['/a', '/a/b/c']),
+    ('/a/**', ['/a', '/a/b', '/a/b/c'], ['/ab']),
+    ('/**/*_server', ['/planner_server', '/navigation/controller_server'], ['/server_x']),
+    ('/a/?', ['/a/b'], ['/a/bc', '/a/b/c']),
+    ('node', ['/node'], ['/a/node']),
+    ('/a.b', ['/a.b'], ['/aXb']),
+])
+def test_patterns_read_as_ros_parameter_file_keys(tmp_path, pattern, matches, misses):
+    rules = load_rules(write_config(tmp_path, {pattern: {'log_level': 'debug'}}))
+
+    for name in matches:
+        assert resolve(rules, name)[1], f'{pattern} should match {name}'
+    for name in misses:
+        assert not resolve(rules, name)[1], f'{pattern} should not match {name}'
+
+
+@pytest.mark.parametrize('pattern', ['/a**', '/**b/node', '/a/***'])
+def test_double_star_inside_a_name_is_refused(tmp_path, pattern):
+    with pytest.raises(RuntimeError, match="must be a whole name"):
+        load_rules(write_config(tmp_path, {pattern: {}}))
 
 
 def test_no_file_gives_no_rules():
@@ -77,7 +165,7 @@ def test_wrong_layout_is_refused(tmp_path):
         load_rules(str(tmp_path / 'missing.yaml'))
 
 
-@pytest.mark.parametrize('content', [{'*': {'log_level': 'debug'}}, {'node': {'*': {}}}])
+@pytest.mark.parametrize('content', [{'/**': {'log_level': 'debug'}}, {'node': {'/**': {}}}])
 def test_rules_outside_nodes_are_refused(tmp_path, content):
     path = tmp_path / 'misplaced.yaml'
     path.write_text(yaml.safe_dump(content))
@@ -156,11 +244,11 @@ def test_wrong_setting_is_refused(tmp_path, settings, message):
 
 def test_log_level_mapping_checks_each_level(tmp_path):
     with pytest.raises(RuntimeError, match="not 'loud'"):
-        load_rules(write_config(tmp_path, {'*': {'log_level': {'rcl': 'loud'}}}))
+        load_rules(write_config(tmp_path, {'/**': {'log_level': {'rcl': 'loud'}}}))
 
 
 def test_level_case_is_free(tmp_path):
-    assert load_rules(write_config(tmp_path, {'*': {'log_level': 'WARN'}}))
+    assert load_rules(write_config(tmp_path, {'/**': {'log_level': 'WARN'}}))
 
 
 def test_rules_that_matched_no_node_are_listed(tmp_path):
@@ -178,7 +266,7 @@ def test_rules_that_matched_no_node_are_listed(tmp_path):
 
 @pytest.mark.parametrize('value', ['true', 'True', '1'])
 def test_dry_run_starts_nothing(tmp_path, value):
-    context = context_for(write_config(tmp_path, {'*': {'log_level': 'info'}}), '/brain')
+    context = context_for(write_config(tmp_path, {'/**': {'log_level': 'info'}}), '/brain')
     context.launch_configurations['dry_run'] = value
     node = ConfiguredNode(package='pkg', executable='exe', name='mode_fsm')
 
@@ -188,7 +276,7 @@ def test_dry_run_starts_nothing(tmp_path, value):
 
 def test_dry_run_of_a_wrong_value_stops_the_launch(tmp_path):
     from launch.conditions import InvalidConditionExpressionError
-    context = context_for(write_config(tmp_path, {'*': {}}), '/brain')
+    context = context_for(write_config(tmp_path, {'/**': {}}), '/brain')
     context.launch_configurations['dry_run'] = 'yes'
 
     with pytest.raises(InvalidConditionExpressionError):
@@ -196,10 +284,10 @@ def test_dry_run_of_a_wrong_value_stops_the_launch(tmp_path):
 
 
 def test_describe_lists_the_changed_settings_and_the_rules(tmp_path):
-    rules = load_rules(write_config(tmp_path, {'*': {}, '/brain/*': {'log_level': 'debug'}}))
+    rules = load_rules(write_config(tmp_path, {'/**': {}, '/brain/*': {'log_level': 'debug'}}))
 
     assert describe('/brain/mode_fsm', *resolve(rules, '/brain/mode_fsm')) == \
-        "/brain/mode_fsm: log_level='debug' (rules: *, /brain/*)"
+        "/brain/mode_fsm: log_level='debug' (rules: /**, /brain/*)"
     assert describe('/a', *resolve([], '/a')) == '/a: defaults (rules: none)'
 
 
@@ -246,7 +334,7 @@ def test_disabled_node_is_not_started(tmp_path):
 
 def test_enabled_must_be_a_boolean(tmp_path):
     with pytest.raises(RuntimeError, match='must be a bool'):
-        load_rules(write_config(tmp_path, {'*': {'enabled': 'no'}}))
+        load_rules(write_config(tmp_path, {'/**': {'enabled': 'no'}}))
 
 
 @pytest.mark.parametrize('required', [True, False])
@@ -300,12 +388,12 @@ def test_respawn_delay_stops_the_launch_if_launch_renamed_it(tmp_path):
 
 def test_respawn_delay_must_be_a_number(tmp_path):
     with pytest.raises(RuntimeError, match='must be a int/float'):
-        load_rules(write_config(tmp_path, {'*': {'respawn_delay': 'soon'}}))
+        load_rules(write_config(tmp_path, {'/**': {'respawn_delay': 'soon'}}))
 
 
 def test_respawn_delay_refuses_a_boolean(tmp_path):
     with pytest.raises(RuntimeError, match='must be a int/float'):
-        load_rules(write_config(tmp_path, {'*': {'respawn_delay': True}}))
+        load_rules(write_config(tmp_path, {'/**': {'respawn_delay': True}}))
 
 
 @pytest.fixture
@@ -379,7 +467,7 @@ def test_two_nodes_cannot_wait_at_the_same_debug_address(tmp_path, fake_package)
 
 def test_debug_takes_only_port_and_host(tmp_path):
     with pytest.raises(RuntimeError, match='takes only'):
-        load_rules(write_config(tmp_path, {'*': {'debug': {'prot': 3000}}}))
+        load_rules(write_config(tmp_path, {'/**': {'debug': {'prot': 3000}}}))
 
 
 def test_empty_debug_mapping_uses_the_defaults(tmp_path, fake_package):
