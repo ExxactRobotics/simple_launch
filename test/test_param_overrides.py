@@ -5,6 +5,7 @@ Run with: python3 -m pytest test/test_param_overrides.py
 
 import pytest
 import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchContext
 from launch.actions import DeclareLaunchArgument
 from launch_ros.actions import Node
@@ -53,6 +54,26 @@ def test_key_other_than_wildcard_and_node_name_is_refused(tmp_path, key):
 def test_missing_file_is_refused(tmp_path):
     with pytest.raises(RuntimeError, match='not found'):
         merge_override_files([str(tmp_path / 'missing.yaml')])
+
+
+def test_substitutions_are_performed_in_the_files(tmp_path, monkeypatch):
+    monkeypatch.setenv('SL_TEST_DIR', '/data')
+    path = tmp_path / 'subst.yaml'
+    path.write_text(
+        '/**/node:\n'
+        '  ros__parameters:\n'
+        '    tree: $(find-pkg-share rclpy)/trees/main.xml\n'
+        '    bags: $(env SL_TEST_DIR)/bags\n'
+        '    mode: $(var mode)\n'
+        '    engine: /opt/models/model.engine\n')
+    context = LaunchContext()
+    context.launch_configurations['mode'] = 'fast'
+
+    params = launch_overrides(context, [str(path)])['/**/node']['ros__parameters']
+
+    assert params == {'tree': get_package_share_directory('rclpy') + '/trees/main.xml',
+                      'bags': '/data/bags', 'mode': 'fast',
+                      'engine': '/opt/models/model.engine'}
 
 
 def test_no_override_gives_a_file_that_sets_nothing():

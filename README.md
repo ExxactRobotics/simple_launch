@@ -234,6 +234,14 @@ ros2 launch my_pkg system_launch.py param_overrides:="fleet.yaml robot.yaml loca
 
 - The files are merged in order, so a later file wins over an earlier one, and the result wins over the parameters given in the launch files.
 - Every top-level key must be `/**` or `/**/<node>`, with no namespace, so that a file applies under any namespace.
+- A file may use the substitutions of launch files, performed when it is read, as launch_ros does for a `ParameterFile` with `allow_substs`: `$(find-pkg-share <pkg>)` for a file of a package, `$(env <name>)`, `$(var <argument>)`. An absolute path is used as it is:
+
+  ```yaml
+  /**/bt_executor:
+    ros__parameters:
+      behaviortree_file: $(find-pkg-share my_trees)/trees/main.xml
+  ```
+
 - A missing file or a wrong key stops the launch. The files are read once per launch, and the result is written to the launch log directory, its path logged at debug level.
 - Every node gets the whole result, so a section also reaches the nodes a process creates itself, such as the costmaps of a Nav2 server.
 - Every launch file created with `SimpleLauncher` lists the argument, so that `--show-args` shows it, but sets no value: an unset argument reads as empty. To give it a default, declare it in a launch file. `SimpleLauncher` puts that declaration first in the file, and since the first declaration to run sets the value, it wins over the declarations of the files it includes. A file that only lists the argument, such as an application that includes the launch file giving the default, leaves that default in place:

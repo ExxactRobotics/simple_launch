@@ -19,6 +19,7 @@ from typing import Any, Callable, List, Optional, Text
 
 import yaml
 from launch import Substitution
+from launch.frontend.parse_substitution import parse_substitution
 from launch.launch_context import LaunchContext
 from launch.logging import get_logger, launch_config
 from launch.substitutions import LaunchConfiguration
@@ -60,16 +61,36 @@ def read_yaml_mapping(path: Text, arg_name: Text) -> dict:
     return content
 
 
-def merge_override_files(paths: List[Text]) -> dict:
+def read_override_file(path: Text, context: Optional[LaunchContext]) -> dict:
+    '''
+    Returns the content of one override file. With a launch context, the substitutions of
+    the launch frontend are performed in its text first, such as $(find-pkg-share <pkg>),
+    $(env <name>) or $(var <argument>), as launch_ros does for a ParameterFile with
+    allow_substs. Raises RuntimeError on a missing file or one that is not a mapping.
+    '''
+    if context is None:
+        return read_yaml_mapping(path, ARG_NAME)
+    if not os.path.isfile(path):
+        raise RuntimeError(f'{ARG_NAME}: file not found: {path}')
+    with open(path) as f:
+        text = perform_substitutions(context, parse_substitution(f.read()))
+    content = yaml.safe_load(text) or {}
+    if not isinstance(content, dict):
+        raise RuntimeError(f'{ARG_NAME}: {path} is not a YAML mapping')
+    return content
+
+
+def merge_override_files(paths: List[Text], context: Optional[LaunchContext] = None) -> dict:
     '''
     Loads the given parameter files and merges them in order, the last one winning.
+    With a launch context, the substitutions of each file are performed first.
     Every top-level key must be '/**' or '/**/<node>': two spellings of the same node
     would stay separate sections whose relative order is not defined.
     Raises RuntimeError on a missing file, a file that is not a mapping or a wrong key.
     '''
     merged = {}
     for path in paths:
-        content = read_yaml_mapping(path, ARG_NAME)
+        content = read_override_file(path, context)
         wrong = [key for key in content if not _is_wildcard_key(key)]
         if wrong:
             raise RuntimeError(
@@ -133,7 +154,7 @@ def launch_overrides(context: LaunchContext, paths: List[Text]) -> dict:
     cache = launch_global(context, 'simple_launch_overrides', dict)
     key = tuple(paths)
     if key not in cache:
-        cache[key] = merge_override_files(paths)
+        cache[key] = merge_override_files(paths, context)
         if paths:
             get_logger('simple_launch').info(f'{ARG_NAME}: {" ".join(paths)}')
     return cache[key]
