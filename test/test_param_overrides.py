@@ -5,6 +5,7 @@ Run with: python3 -m pytest test/test_param_overrides.py
 
 import pytest
 import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchContext
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions.substitution_failure import SubstitutionFailure
@@ -56,6 +57,26 @@ def test_missing_file_is_refused(tmp_path):
         merge_override_files([str(tmp_path / 'missing.yaml')])
 
 
+def test_substitutions_are_performed_in_the_files(tmp_path, monkeypatch):
+    monkeypatch.setenv('SL_TEST_DIR', '/data')
+    path = tmp_path / 'subst.yaml'
+    path.write_text(
+        '/**/node:\n'
+        '  ros__parameters:\n'
+        '    tree: $(find-pkg-share rclpy)/trees/main.xml\n'
+        '    bags: $(env SL_TEST_DIR)/bags\n'
+        '    mode: $(var mode)\n'
+        '    engine: /opt/models/model.engine\n')
+    context = LaunchContext()
+    context.launch_configurations['mode'] = 'fast'
+
+    params = merge_override_files([str(path)], context)['/**/node']['ros__parameters']
+
+    assert params == {'tree': get_package_share_directory('rclpy') + '/trees/main.xml',
+                      'bags': '/data/bags', 'mode': 'fast',
+                      'engine': '/opt/models/model.engine'}
+
+
 def test_no_override_gives_a_file_that_sets_nothing():
     assert node_sections({}) == {'/**/**': section()}
 
@@ -71,18 +92,76 @@ def test_sections_are_keyed_as_no_other_file_does_wildcard_first():
     assert sections['/**/**/talker'] == section(rate=2.0)
 
 
-def test_files_are_read_once_per_launch(tmp_path, monkeypatch):
+def test_each_node_gets_the_substitutions_of_its_scope(tmp_path, monkeypatch):
     monkeypatch.setattr(param_overrides.launch_config, '_log_dir', str(tmp_path / 'log'))
-    a = write(tmp_path, 'a.yaml', {'/**/node': section(rate=1.0)})
+    path = tmp_path / 'o.yaml'
+    path.write_text('/**/node:\n  ros__parameters:\n    mode: $(var mode)\n')
     context = LaunchContext()
-    context.launch_configurations['param_overrides'] = a
+    context.launch_configurations['param_overrides'] = str(path)
 
-    first = MergedOverrides().perform(context)
-    write(tmp_path, 'a.yaml', {'/**/node': section(rate=2.0)})
+    def resolved(mode):
+        # two included files giving the argument their own value
+        context.launch_configurations['mode'] = mode
+        written = MergedOverrides().perform(context)
+        with open(written) as f:
+            return written, yaml.safe_load(f)['/**/**/node']['ros__parameters']['mode']
 
-    assert MergedOverrides().perform(context) == first
-    with open(first) as f:
-        assert yaml.safe_load(f) == {'/**/**/node': section(rate=1.0)}
+    fast, slow = resolved('fast'), resolved('slow')
+    assert fast[1] == 'fast' and slow[1] == 'slow'
+    assert fast[0] != slow[0]
+    assert resolved('fast') == fast
+
+
+def read_text(tmp_path, text, context=None):
+    path = tmp_path / 'o.yaml'
+    path.write_text(text)
+    return merge_override_files([str(path)], context or LaunchContext())
+
+
+def test_backslashes_are_kept(tmp_path, monkeypatch):
+    monkeypatch.setenv('SL_TEST_DIR', '/data')
+    merged = read_text(tmp_path,
+                       '/**/node:\n'
+                       '  ros__parameters:\n'
+                       '    pattern: "^\\\\d+$"\n'
+                       "    folder: 'C:\\tmp'\n"
+                       '    bags: $(env SL_TEST_DIR)/bags\n')
+
+    assert merged['/**/node']['ros__parameters'] == {
+        'pattern': '^\\d+$', 'folder': 'C:\\tmp', 'bags': '/data/bags'}
+
+
+def test_comments_are_not_substituted(tmp_path):
+    merged = read_text(tmp_path,
+                       '# set by $(var robot) at runtime\n'
+                       '/**/node:\n'
+                       '  ros__parameters:\n'
+                       '    rate: 2.0  # $(unknown)\n')
+
+    assert merged == {'/**/node': section(rate=2.0)}
+
+
+def test_unquoted_substitution_takes_the_type_of_its_value(tmp_path):
+    context = LaunchContext()
+    context.launch_configurations.update(flag='true', rate='2.5', node='mode_fsm')
+    merged = read_text(tmp_path,
+                       '/**/$(var node):\n'
+                       '  ros__parameters:\n'
+                       '    flag: $(var flag)\n'
+                       '    rate: $(var rate)\n'
+                       '    quoted: "$(var flag)"\n'
+                       '    suffixed: $(var flag)/x\n'
+                       '    listed: [$(var rate)]\n', context)
+
+    assert merged == {'/**/mode_fsm': section(
+        flag=True, rate=2.5, quoted='true', suffixed='true/x', listed=[2.5])}
+
+
+@pytest.mark.parametrize('value', [
+    '$(unknown)', '$(var missing)', '$(find-pkg-share no_such_package)', '$(var'])
+def test_substitution_error_names_the_file(tmp_path, value):
+    with pytest.raises(RuntimeError, match='o.yaml'):
+        read_text(tmp_path, f'/**/node:\n  ros__parameters:\n    x: {value}\n')
 
 
 @pytest.mark.parametrize('parameters', [None, {'a': 1}, [{'a': 1}, 'file.yaml']])

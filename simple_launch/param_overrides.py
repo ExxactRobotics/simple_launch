@@ -19,6 +19,7 @@ from typing import Any, Callable, List, Optional, Text
 
 import yaml
 from launch import Substitution
+from launch.frontend.parse_substitution import parse_substitution
 from launch.launch_context import LaunchContext
 from launch.logging import get_logger, launch_config
 from launch.substitutions import LaunchConfiguration
@@ -46,7 +47,7 @@ def _deep_merge(base: dict, update: dict) -> dict:
     return base
 
 
-def read_yaml_mapping(path: Text, arg_name: Text) -> dict:
+def read_yaml_mapping(path: Text, arg_name: Text, loader=yaml.SafeLoader) -> dict:
     '''
     Returns the content of the YAML file given by a launch argument, empty for an empty file.
     Raises RuntimeError on a missing file or one that is not a mapping.
@@ -54,22 +55,87 @@ def read_yaml_mapping(path: Text, arg_name: Text) -> dict:
     if not os.path.isfile(path):
         raise RuntimeError(f'{arg_name}: file not found: {path}')
     with open(path) as f:
-        content = yaml.safe_load(f) or {}
+        content = yaml.load(f, Loader=loader) or {}
     if not isinstance(content, dict):
         raise RuntimeError(f'{arg_name}: {path} is not a YAML mapping')
     return content
 
 
-def merge_override_files(paths: List[Text]) -> dict:
+class _Template(str):
+    '''
+    A string of an override file that holds a launch substitution. A plain one was written
+    unquoted, so its result takes the type YAML gives it, as if written in the file.
+    '''
+
+    def __new__(cls, text: Text, plain: bool):
+        template = super().__new__(cls, text)
+        template.plain = plain
+        return template
+
+
+class _TemplateLoader(yaml.SafeLoader):
+    '''
+    YAML loader that reads the strings holding a launch substitution as templates
+    '''
+
+
+def _construct_str(loader: yaml.SafeLoader, node: yaml.ScalarNode):
+    text = loader.construct_scalar(node)
+    return _Template(text, node.style is None) if '$(' in text else text
+
+
+_STR_TAG = 'tag:yaml.org,2002:str'
+_TemplateLoader.add_constructor(_STR_TAG, _construct_str)
+_RESOLVER = yaml.resolver.Resolver()
+
+
+def _perform_templates(value, context: LaunchContext):
+    '''
+    Returns the content with the substitutions of its templates performed
+    '''
+    if isinstance(value, dict):
+        return {_perform_templates(key, context): _perform_templates(item, context)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_perform_templates(item, context) for item in value]
+    if not isinstance(value, _Template):
+        return value
+    text = perform_substitutions(context, parse_substitution(str(value)))
+    if value.plain and _RESOLVER.resolve(yaml.ScalarNode, text, (True, False)) != _STR_TAG:
+        return yaml.safe_load(text)
+    return text
+
+
+def read_override_file(path: Text, context: Optional[LaunchContext]) -> dict:
+    '''
+    Returns the content of one override file. With a launch context, the substitutions of
+    the launch frontend in its strings are performed, such as $(find-pkg-share <pkg>),
+    $(env <name>) or $(var <argument>), as launch_ros does for a ParameterFile with
+    allow_substs. Raises RuntimeError on a missing file, one that is not a mapping or a
+    substitution that fails.
+    '''
+    if context is None:
+        return read_yaml_mapping(path, ARG_NAME)
+    content = read_yaml_mapping(path, ARG_NAME, _TemplateLoader)
+    try:
+        return _perform_templates(content, context)
+    except Exception as error:
+        # the parser, the package index and the substitutions each raise their own types
+        cause = getattr(error, 'orig_exc', error)
+        raise RuntimeError(f'{ARG_NAME}: {path}: {cause}') from error
+
+
+def merge_override_files(paths: List[Text], context: Optional[LaunchContext] = None) -> dict:
     '''
     Loads the given parameter files and merges them in order, the last one winning.
+    With a launch context, the substitutions of each file are performed first.
     Every top-level key must be '/**' or '/**/<node>': two spellings of the same node
     would stay separate sections whose relative order is not defined.
     Raises RuntimeError on a missing file, a file that is not a mapping or a wrong key.
     '''
     merged = {}
     for path in paths:
-        content = read_yaml_mapping(path, ARG_NAME)
+        content = read_override_file(path, context)
         wrong = [key for key in content if not _is_wildcard_key(key)]
         if wrong:
             raise RuntimeError(
@@ -88,7 +154,7 @@ def node_sections(merged: dict) -> dict:
         or {'/**/**': {'ros__parameters': {}}}
 
 
-def write_overrides(content: dict, paths: List[Text]) -> Text:
+def write_overrides(text: Text, paths: List[Text]) -> Text:
     '''
     Writes a parameter file headed by the override files it comes from to the launch log
     directory, and returns its path
@@ -97,7 +163,7 @@ def write_overrides(content: dict, paths: List[Text]) -> Text:
     fd, out_path = tempfile.mkstemp(prefix=f'{ARG_NAME}_', suffix='.yaml', dir=launch_config.log_dir)
     with os.fdopen(fd, 'w') as f:
         f.write(''.join(f'# {path}\n' for path in paths))
-        yaml.safe_dump(content, f, default_flow_style=False)
+        f.write(text)
     return out_path
 
 
@@ -125,7 +191,8 @@ def launch_global(context: LaunchContext, key: Text, create: Callable[[], Any]) 
 class MergedOverrides(Substitution):
     '''
     Substitution that resolves to the parameter file every node gets from the param_overrides
-    launch argument. The files are read and written once per launch.
+    launch argument. The files are read for each node, with the launch configurations of its
+    scope, and the nodes that get the same content share one written file.
     '''
 
     def __init__(self):
@@ -138,11 +205,12 @@ class MergedOverrides(Substitution):
     def perform(self, context: LaunchContext) -> Text:
         paths = [os.path.abspath(os.path.expanduser(f))
                  for f in perform_substitutions(context, [self.__files]).split()]
+        text = yaml.safe_dump(node_sections(merge_override_files(paths, context)),
+                              default_flow_style=False)
         written = launch_global(context, 'simple_launch_override_files', dict)
-        key = tuple(paths)
+        key = (tuple(paths), text)
         if key not in written:
-            content = node_sections(merge_override_files(paths))
-            written[key] = write_overrides(content, paths)
+            written[key] = write_overrides(text, paths)
             if paths:
                 get_logger('simple_launch').info(f'{ARG_NAME}: {" ".join(paths)}')
             get_logger('simple_launch').debug(f'{ARG_NAME}: {written[key]}')
