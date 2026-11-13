@@ -234,7 +234,8 @@ ros2 launch my_pkg system_launch.py param_overrides:="fleet.yaml robot.yaml loca
 
 - The files are merged in order, so a later file wins over an earlier one, and the result wins over the parameters given in the launch files.
 - Every top-level key must be `/**` or `/**/<node>`, with no namespace, so that a file applies under any namespace.
-- A missing file or a wrong key stops the launch. The files are read once per launch, and each node's share is written to the launch log directory, its path logged at debug level. Nodes with nothing to override share one empty file.
+- A missing file or a wrong key stops the launch. The files are read once per launch, and the result is written to the launch log directory, its path logged at debug level.
+- Every node gets the whole result, so a section also reaches the nodes a process creates itself, such as the costmaps of a Nav2 server.
 - Every launch file created with `SimpleLauncher` declares the argument with an empty default, so that `--show-args` lists it. To give it a default, declare it in the top-level launch file. `SimpleLauncher` puts that declaration first in the file, and since the first declaration to run sets the value, it wins over the empty default of the files it includes:
 
 ```python

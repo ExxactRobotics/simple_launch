@@ -59,7 +59,7 @@ def test_no_override_gives_a_file_that_sets_nothing():
     assert node_sections({}) == {'/**/**': section()}
 
 
-def test_unnamed_node_gets_sections_no_other_file_uses_wildcard_first():
+def test_sections_are_keyed_as_no_other_file_does_wildcard_first():
     # rcl merges a key already seen in an earlier file into that earlier section, which
     # the launch file's own parameters then win over
     merged = {'/**/talker': section(rate=2.0), '/**': section(rate=1.0)}
@@ -112,26 +112,20 @@ def test_node_keeps_each_given_parameter_file(parameters, given):
     assert isinstance(params[-1].param_file[0], MergedOverrides)
 
 
-def overrides_file(context, name):
-    node = Node(package='pkg', executable='exe', name=name)
-    node._perform_substitutions(context)
-    overrides = MergedOverrides()
-    overrides.node = node
-    return overrides.perform(context)
-
-
-def test_nodes_with_nothing_to_override_share_one_file(tmp_path, monkeypatch):
+def test_every_node_gets_the_same_file(tmp_path, monkeypatch):
     monkeypatch.setattr(param_overrides.launch_config, '_log_dir', str(tmp_path / 'log'))
     overrides = write(tmp_path, 'o.yaml', {'/**/mode_fsm': section(rate=2.0)})
 
     without = LaunchContext()
-    assert overrides_file(without, 'a') == overrides_file(without, 'b')
+    assert MergedOverrides().perform(without) == MergedOverrides().perform(without)
 
     given = LaunchContext()
     given.launch_configurations['param_overrides'] = overrides
-    assert overrides_file(given, 'a') == overrides_file(given, 'b')
-    assert overrides_file(given, 'mode_fsm') != overrides_file(given, 'a')
-    assert len(list((tmp_path / 'log').iterdir())) == 3
+    path = MergedOverrides().perform(given)
+    assert MergedOverrides().perform(given) == path
+    with open(path) as f:
+        assert yaml.safe_load(f) == {'/**/**/mode_fsm': section(rate=2.0)}
+    assert len(list((tmp_path / 'log').iterdir())) == 2
 
 
 FILE_ARGS = ['param_overrides', 'launch_config']
@@ -191,13 +185,14 @@ def test_own_declaration_is_kept_and_moved_first(name):
     assert value_after(actions + included, context, name) == 'site.yaml'
 
 
-def test_named_node_gets_its_sections_under_its_full_name():
-    merged = {'/**': section(shared=1, rate=1.0),
-              '/**/mode_fsm': section(rate=2.0),
-              '/**/other': section(x=1)}
+def test_sections_of_nodes_a_process_creates_are_kept():
+    # a Nav2 server creates its costmap as a node of its own process
+    merged = {'/**/controller_server': section(rate=2.0),
+              '/**/local_costmap': {'local_costmap': section(width=6)}}
 
-    assert node_sections(merged, '/brain/mode_fsm') == {
-        '/brain/mode_fsm': section(shared=1, rate=2.0)}
+    assert node_sections(merged) == {
+        '/**/**/controller_server': section(rate=2.0),
+        '/**/**/local_costmap': {'local_costmap': section(width=6)}}
 
 
 @pytest.mark.parametrize('name, namespace, push, expected', [

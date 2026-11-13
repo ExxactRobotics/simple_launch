@@ -7,13 +7,12 @@ after its own parameters.
 
 rcl applies parameter sections in the order their keys first appear, not file by file: a
 /**/<node> section of an override would land in the package file's earlier section, before the
-section launch_ros writes for the parameters a launch file gives. So a named node gets its
-overrides keyed by its full name, which comes after both. A node with no name in the launch
-file, and a component, get them keyed '/**/**' and '/**/**/<node>': these match the same nodes
-as '/**' and '/**/<node>', but no other file uses them, so they also come last.
+section launch_ros writes for the parameters a launch file gives. So the overrides are keyed
+'/**/**' and '/**/**/<node>': these match the same nodes as '/**' and '/**/<node>', but no other
+file uses them, so they come last. Every node gets all the sections, so that they also reach
+the nodes a process creates itself, such as the costmaps of a Nav2 server.
 '''
 
-import copy
 import os
 import tempfile
 from typing import Any, Callable, List, Optional, Text
@@ -79,20 +78,14 @@ def merge_override_files(paths: List[Text]) -> dict:
     return merged
 
 
-def node_sections(merged: dict, full_name: Optional[Text] = None) -> dict:
+def node_sections(merged: dict) -> dict:
     '''
-    Returns the parameter file content of one node. With its full name, the '/**' and
-    '/**/<node>' sections are merged under that name; without, every section is kept under
-    its '/**/**' spelling, the '/**' one first so that the node sections win over it.
+    Returns the parameter file content given to every node: each section under its '/**/**'
+    spelling, the '/**' one first so that the node sections win over it
     '''
-    if full_name is None:
-        keys = sorted(merged, key=lambda key: key != '/**')
-        return {'/**/**' + key[len('/**'):]: merged[key] for key in keys} \
-            or {'/**/**': {'ros__parameters': {}}}
-    params = {}
-    for section in ('/**', '/**/' + full_name.rsplit('/', 1)[-1]):
-        _deep_merge(params, copy.deepcopy(merged.get(section, {}).get('ros__parameters', {})))
-    return {full_name: {'ros__parameters': params}}
+    keys = sorted(merged, key=lambda key: key != '/**')
+    return {'/**/**' + key[len('/**'):]: merged[key] for key in keys} \
+        or {'/**/**': {'ros__parameters': {}}}
 
 
 def write_overrides(content: dict, paths: List[Text]) -> Text:
@@ -155,8 +148,6 @@ class MergedOverrides(Substitution):
     def __init__(self):
         super().__init__()
         self.__files = LaunchConfiguration(ARG_NAME, default='')
-        # the node these overrides are for, set once it is created; None for a composable node
-        self.node = None
 
     def describe(self) -> Text:
         return f'MergedOverrides({ARG_NAME})'
@@ -164,16 +155,11 @@ class MergedOverrides(Substitution):
     def perform(self, context: LaunchContext) -> Text:
         paths = [os.path.abspath(os.path.expanduser(f))
                  for f in perform_substitutions(context, [self.__files]).split()]
-        merged = launch_overrides(context, paths)
-        # performed with the parameters, once the node's name is resolved
-        full_name = None if self.node is None else full_node_name(self.node)
-        content = node_sections(merged, full_name)
-        if not any(section.get('ros__parameters') for section in content.values()):
-            # nothing to override for this node: every such node shares one empty file
-            empty = launch_global(context, 'simple_launch_empty_overrides', dict)
-            if 'path' not in empty:
-                empty['path'] = write_overrides(content, paths)
-            return empty['path']
-        path = write_overrides(content, paths)
-        get_logger('simple_launch').debug(f'{ARG_NAME}: {full_name or "unnamed node"}: {path}')
-        return path
+        # every node gets the same content, written once per launch
+        written = launch_global(context, 'simple_launch_override_files', dict)
+        key = tuple(paths)
+        if key not in written:
+            content = node_sections(launch_overrides(context, paths))
+            written[key] = write_overrides(content, paths)
+            get_logger('simple_launch').debug(f'{ARG_NAME}: {written[key]}')
+        return written[key]
