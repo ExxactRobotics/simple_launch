@@ -7,6 +7,7 @@ import pytest
 import yaml
 from launch import LaunchContext
 from launch.actions import DeclareLaunchArgument
+from launch.substitutions.substitution_failure import SubstitutionFailure
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterFile
 
@@ -140,10 +141,10 @@ def declarations(actions, name):
 
 
 def value_after(actions, context, name):
-    # runs the declarations of a description in order, as the launch does
+    # runs the declarations of a description in order, as the launch does; unset reads as empty
     for action in declarations(actions, name):
         action.execute(context)
-    return context.launch_configurations[name]
+    return context.launch_configurations.get(name, '')
 
 
 @pytest.mark.parametrize('name', FILE_ARGS)
@@ -160,6 +161,31 @@ def test_launcher_declares_the_file_arguments_first_with_no_default(name, opaque
     assert len(declared) == 1
     assert actions.index(declared[0]) < len(FILE_ARGS)
     assert value_after(actions, LaunchContext(), name) == ''
+
+
+@pytest.mark.parametrize('name', FILE_ARGS)
+def test_listed_argument_leaves_the_default_of_an_included_file(name):
+    # an application that only includes the file that gives the default
+    application = SimpleLauncher().launch_description().entities
+    sl = SimpleLauncher(use_sim_time=False)
+    sl.declare_arg(name, default_value='site.yaml')
+    included = sl.launch_description().entities
+
+    context = LaunchContext()
+    assert value_after(application, context, name) == ''
+    assert name not in context.launch_configurations
+    assert value_after(application + included, LaunchContext(), name) == 'site.yaml'
+
+
+@pytest.mark.parametrize('name', FILE_ARGS)
+def test_unset_file_argument_reads_as_empty(name):
+    # a file forwarding the argument to an include reads it while only listed
+    context = LaunchContext()
+    assert SimpleLauncher().arg(name).perform(context) == ''
+    context.launch_configurations[name] = 'site.yaml'
+    assert SimpleLauncher().arg(name).perform(context) == 'site.yaml'
+    with pytest.raises(SubstitutionFailure):
+        SimpleLauncher().arg('other').perform(context)
 
 
 @pytest.mark.parametrize('name', FILE_ARGS)
@@ -182,7 +208,7 @@ def test_own_declaration_is_kept_and_moved_first(name):
     assert len(declared) == 1
     assert actions.index(declared[0]) < len(FILE_ARGS)
 
-    # the empty default of an included file runs later and changes nothing
+    # the listed argument of an included file runs later and changes nothing
     included = SimpleLauncher().launch_description().entities
     context = LaunchContext()
     assert value_after(actions + included, context, name) == 'site.yaml'
