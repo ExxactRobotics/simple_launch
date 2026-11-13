@@ -440,7 +440,6 @@ class SimpleLauncher:
 
         # basic node, with the settings of the launch_config file
         node = ConfiguredNode(package=package, executable=executable, **node_args)
-        overrides.node = node
         return self.add_action(node)
 
     def log_info(self, msg):
