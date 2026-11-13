@@ -28,16 +28,34 @@ FILE_ARGS = {
 }
 
 
+class ListedArgument(DeclareLaunchArgument):
+    '''
+    A launch argument that is only listed: --show-args shows it, and its empty default keeps an
+    including file from asking for it, but it sets no value. An unset one is read as empty, and a
+    file that does not give the argument a default leaves the default of the files it includes in
+    place.
+    '''
+
+    def __init__(self, name, **kwargs):
+        super().__init__(name, default_value='', **kwargs)
+
+    def execute(self, context):
+        if self.name in context.launch_configurations:
+            return super().execute(context)
+        return None
+
+
 def with_file_arguments(actions: list) -> list:
     '''
-    Returns the actions with the declarations of the FILE_ARGS arguments first, adding an empty
-    default for those this file does not declare.
+    Returns the actions with the declarations of the FILE_ARGS arguments first, listing those this
+    file does not declare.
     A declaration sets its default only while the value is unset, so the first one to run wins.
-    Running first, the declaration of this file wins over those of the files it includes.
+    Running first, the declaration of this file wins over those of the files it includes; a listed
+    argument sets nothing, so it lets the default of an included file apply.
     '''
     own = {action.name: action for action in actions
            if isinstance(action, DeclareLaunchArgument) and action.name in FILE_ARGS}
-    first = [own.get(name) or DeclareLaunchArgument(name, default_value='', description=description)
+    first = [own.get(name) or ListedArgument(name, description=description)
              for name, description in FILE_ARGS.items()]
     return first + [action for action in actions if action not in own.values()]
 
