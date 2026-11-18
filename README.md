@@ -234,12 +234,24 @@ ros2 launch my_pkg system_launch.py param_overrides:="fleet.yaml robot.yaml loca
 
 - The files are merged in order, so a later file wins over an earlier one, and the result wins over the parameters given in the launch files.
 - Every top-level key must be `/**` or `/**/<node>`, with no namespace, so that a file applies under any namespace.
-- A missing file or a wrong key stops the launch. The files are read once per launch, and each node's share is written to the launch log directory, its path logged at debug level. Nodes with nothing to override share one empty file.
-- Every launch file created with `SimpleLauncher` declares the argument with an empty default, so that `--show-args` lists it. To give it a default, declare it in the top-level launch file. `SimpleLauncher` puts that declaration first in the file, and since the first declaration to run sets the value, it wins over the empty default of the files it includes:
+- A string of a file may use the substitutions of launch files, as launch_ros does for a `ParameterFile` with `allow_substs`: `$(find-pkg-share <pkg>)` for a file of a package, `$(env <name>)`, `$(var <argument>)`. They are performed for each node, with the arguments of its launch file, so every node must be able to resolve them. An unquoted value takes the type of its result, as if written in the file, and a backslash in a string holding a substitution escapes the next character, as in launch files. Comments are left alone. An absolute path is used as it is:
+
+  ```yaml
+  /**/bt_executor:
+    ros__parameters:
+      behaviortree_file: $(find-pkg-share my_trees)/trees/main.xml
+  ```
+
+- A missing file, a wrong key or a substitution that fails stops the launch. The result is written to the launch log directory, once for all the nodes that get the same content, its path logged at debug level.
+- Every node gets the whole result, so a section also reaches the nodes a process creates itself, such as the costmaps of a Nav2 server.
+  A component loaded into a container is the exception: launch_ros passes it only the sections that match its own name, so a section for a node it creates itself, such as its costmap, does not reach that node.
+- Every launch file created with `SimpleLauncher` lists the argument, so that `--show-args` shows it, but sets no value: an unset argument reads as empty through `sl.arg`, and `LaunchConfiguration` needs `default=''` to read it. To give it a default, declare it in a launch file. `SimpleLauncher` puts that declaration first in the file, and since the first declaration to run sets the value, it wins over the declarations of the files it includes. A file that only lists the argument, such as an application that includes the launch file giving the default, leaves that default in place:
 
 ```python
 sl.declare_arg('param_overrides', default_value = sl.find('my_pkg', 'overrides.yaml'))
 ```
+
+A file that only lists the argument sets nothing, so with unscoped includes, the default of `SimpleLauncher`, a default declared by an included file stays set after that include: it also reaches the later includes and nodes of the including file. `SimpleLauncher(scope_included_files=True)` keeps it to that include.
 
 
 ## Launch settings file
@@ -276,7 +288,7 @@ ros2 launch my_pkg system_launch.py launch_config:=dev.yaml
   A node given no name is matched by its executable name. A node named like a setting, such as `debug`, is written in the flat form.
 - Rules apply from top to bottom, and for each setting the last rule that matches and names it wins: put the catch-all first, then groups, then single nodes.
 - The settings are resolved when the node starts, so the namespaces pushed by including files are part of its name.
-- Like `param_overrides`, the argument is declared with an empty default by every launch file created with `SimpleLauncher`: declare it in the top-level file to give it a default.
+- Like `param_overrides`, the argument is listed by every launch file created with `SimpleLauncher` and is empty unless given or declared: declare it in a launch file to give it a default.
 - `dry_run:=true` logs the settings each node created with `sl.node` would get and the rules that gave them, and starts none of them. Processes started otherwise still start: included launch files that do not use `SimpleLauncher`, and `ExecuteProcess` actions.
 - In a container created with `sl.container`, each component is matched by its own full name (its plugin class name when it has no name). `enabled` and `log_level` act on the component, `log_level` only when the component has a name, since its logger is otherwise named by its constructor; the settings that act on a process (`prefix`, `required`, `respawn`, `debug`) apply to the container only. Components loaded with `existing=True` go into a process started elsewhere: only `enabled` applies, and a `log_level` is warned about.
 - An unknown setting or a value of the wrong type stops the launch. A rule that matched no node, often a mistyped pattern, is logged when the launch shuts down.

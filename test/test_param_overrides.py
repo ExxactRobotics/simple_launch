@@ -5,14 +5,16 @@ Run with: python3 -m pytest test/test_param_overrides.py
 
 import pytest
 import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchContext
 from launch.actions import DeclareLaunchArgument
+from launch.substitutions.substitution_failure import SubstitutionFailure
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterFile
 
 from simple_launch import SimpleLauncher, param_overrides
-from simple_launch.param_overrides import (MergedOverrides, full_node_name, launch_overrides,
-                                           merge_override_files, node_sections)
+from simple_launch.param_overrides import (MergedOverrides, full_node_name, merge_override_files,
+                                           node_sections)
 
 
 def write(tmp_path, name, content):
@@ -55,11 +57,31 @@ def test_missing_file_is_refused(tmp_path):
         merge_override_files([str(tmp_path / 'missing.yaml')])
 
 
+def test_substitutions_are_performed_in_the_files(tmp_path, monkeypatch):
+    monkeypatch.setenv('SL_TEST_DIR', '/data')
+    path = tmp_path / 'subst.yaml'
+    path.write_text(
+        '/**/node:\n'
+        '  ros__parameters:\n'
+        '    tree: $(find-pkg-share rclpy)/trees/main.xml\n'
+        '    bags: $(env SL_TEST_DIR)/bags\n'
+        '    mode: $(var mode)\n'
+        '    engine: /opt/models/model.engine\n')
+    context = LaunchContext()
+    context.launch_configurations['mode'] = 'fast'
+
+    params = merge_override_files([str(path)], context)['/**/node']['ros__parameters']
+
+    assert params == {'tree': get_package_share_directory('rclpy') + '/trees/main.xml',
+                      'bags': '/data/bags', 'mode': 'fast',
+                      'engine': '/opt/models/model.engine'}
+
+
 def test_no_override_gives_a_file_that_sets_nothing():
     assert node_sections({}) == {'/**/**': section()}
 
 
-def test_unnamed_node_gets_sections_no_other_file_uses_wildcard_first():
+def test_sections_are_keyed_as_no_other_file_does_wildcard_first():
     # rcl merges a key already seen in an earlier file into that earlier section, which
     # the launch file's own parameters then win over
     merged = {'/**/talker': section(rate=2.0), '/**': section(rate=1.0)}
@@ -70,15 +92,76 @@ def test_unnamed_node_gets_sections_no_other_file_uses_wildcard_first():
     assert sections['/**/**/talker'] == section(rate=2.0)
 
 
-def test_files_are_read_once_per_launch(tmp_path):
-    a = write(tmp_path, 'a.yaml', {'/**/node': section(rate=1.0)})
+def test_each_node_gets_the_substitutions_of_its_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(param_overrides.launch_config, '_log_dir', str(tmp_path / 'log'))
+    path = tmp_path / 'o.yaml'
+    path.write_text('/**/node:\n  ros__parameters:\n    mode: $(var mode)\n')
     context = LaunchContext()
+    context.launch_configurations['param_overrides'] = str(path)
 
-    first = launch_overrides(context, [a])
-    write(tmp_path, 'a.yaml', {'/**/node': section(rate=2.0)})
+    def resolved(mode):
+        # two included files giving the argument their own value
+        context.launch_configurations['mode'] = mode
+        written = MergedOverrides().perform(context)
+        with open(written) as f:
+            return written, yaml.safe_load(f)['/**/**/node']['ros__parameters']['mode']
 
-    assert launch_overrides(context, [a]) is first
-    assert launch_overrides(LaunchContext(), [a]) == {'/**/node': section(rate=2.0)}
+    fast, slow = resolved('fast'), resolved('slow')
+    assert fast[1] == 'fast' and slow[1] == 'slow'
+    assert fast[0] != slow[0]
+    assert resolved('fast') == fast
+
+
+def read_text(tmp_path, text, context=None):
+    path = tmp_path / 'o.yaml'
+    path.write_text(text)
+    return merge_override_files([str(path)], context or LaunchContext())
+
+
+def test_backslashes_are_kept(tmp_path, monkeypatch):
+    monkeypatch.setenv('SL_TEST_DIR', '/data')
+    merged = read_text(tmp_path,
+                       '/**/node:\n'
+                       '  ros__parameters:\n'
+                       '    pattern: "^\\\\d+$"\n'
+                       "    folder: 'C:\\tmp'\n"
+                       '    bags: $(env SL_TEST_DIR)/bags\n')
+
+    assert merged['/**/node']['ros__parameters'] == {
+        'pattern': '^\\d+$', 'folder': 'C:\\tmp', 'bags': '/data/bags'}
+
+
+def test_comments_are_not_substituted(tmp_path):
+    merged = read_text(tmp_path,
+                       '# set by $(var robot) at runtime\n'
+                       '/**/node:\n'
+                       '  ros__parameters:\n'
+                       '    rate: 2.0  # $(unknown)\n')
+
+    assert merged == {'/**/node': section(rate=2.0)}
+
+
+def test_unquoted_substitution_takes_the_type_of_its_value(tmp_path):
+    context = LaunchContext()
+    context.launch_configurations.update(flag='true', rate='2.5', node='mode_fsm')
+    merged = read_text(tmp_path,
+                       '/**/$(var node):\n'
+                       '  ros__parameters:\n'
+                       '    flag: $(var flag)\n'
+                       '    rate: $(var rate)\n'
+                       '    quoted: "$(var flag)"\n'
+                       '    suffixed: $(var flag)/x\n'
+                       '    listed: [$(var rate)]\n', context)
+
+    assert merged == {'/**/mode_fsm': section(
+        flag=True, rate=2.5, quoted='true', suffixed='true/x', listed=[2.5])}
+
+
+@pytest.mark.parametrize('value', [
+    '$(unknown)', '$(var missing)', '$(find-pkg-share no_such_package)', '$(var'])
+def test_substitution_error_names_the_file(tmp_path, value):
+    with pytest.raises(RuntimeError, match='o.yaml'):
+        read_text(tmp_path, f'/**/node:\n  ros__parameters:\n    x: {value}\n')
 
 
 @pytest.mark.parametrize('parameters', [None, {'a': 1}, [{'a': 1}, 'file.yaml']])
@@ -112,26 +195,20 @@ def test_node_keeps_each_given_parameter_file(parameters, given):
     assert isinstance(params[-1].param_file[0], MergedOverrides)
 
 
-def overrides_file(context, name):
-    node = Node(package='pkg', executable='exe', name=name)
-    node._perform_substitutions(context)
-    overrides = MergedOverrides()
-    overrides.node = node
-    return overrides.perform(context)
-
-
-def test_nodes_with_nothing_to_override_share_one_file(tmp_path, monkeypatch):
+def test_every_node_gets_the_same_file(tmp_path, monkeypatch):
     monkeypatch.setattr(param_overrides.launch_config, '_log_dir', str(tmp_path / 'log'))
     overrides = write(tmp_path, 'o.yaml', {'/**/mode_fsm': section(rate=2.0)})
 
     without = LaunchContext()
-    assert overrides_file(without, 'a') == overrides_file(without, 'b')
+    assert MergedOverrides().perform(without) == MergedOverrides().perform(without)
 
     given = LaunchContext()
     given.launch_configurations['param_overrides'] = overrides
-    assert overrides_file(given, 'a') == overrides_file(given, 'b')
-    assert overrides_file(given, 'mode_fsm') != overrides_file(given, 'a')
-    assert len(list((tmp_path / 'log').iterdir())) == 3
+    path = MergedOverrides().perform(given)
+    assert MergedOverrides().perform(given) == path
+    with open(path) as f:
+        assert yaml.safe_load(f) == {'/**/**/mode_fsm': section(rate=2.0)}
+    assert len(list((tmp_path / 'log').iterdir())) == 2
 
 
 FILE_ARGS = ['param_overrides', 'launch_config']
@@ -143,10 +220,10 @@ def declarations(actions, name):
 
 
 def value_after(actions, context, name):
-    # runs the declarations of a description in order, as the launch does
+    # runs the declarations of a description in order, as the launch does; unset reads as empty
     for action in declarations(actions, name):
         action.execute(context)
-    return context.launch_configurations[name]
+    return context.launch_configurations.get(name, '')
 
 
 @pytest.mark.parametrize('name', FILE_ARGS)
@@ -163,6 +240,31 @@ def test_launcher_declares_the_file_arguments_first_with_no_default(name, opaque
     assert len(declared) == 1
     assert actions.index(declared[0]) < len(FILE_ARGS)
     assert value_after(actions, LaunchContext(), name) == ''
+
+
+@pytest.mark.parametrize('name', FILE_ARGS)
+def test_listed_argument_leaves_the_default_of_an_included_file(name):
+    # an application that only includes the file that gives the default
+    application = SimpleLauncher().launch_description().entities
+    sl = SimpleLauncher(use_sim_time=False)
+    sl.declare_arg(name, default_value='site.yaml')
+    included = sl.launch_description().entities
+
+    context = LaunchContext()
+    assert value_after(application, context, name) == ''
+    assert name not in context.launch_configurations
+    assert value_after(application + included, LaunchContext(), name) == 'site.yaml'
+
+
+@pytest.mark.parametrize('name', FILE_ARGS)
+def test_unset_file_argument_reads_as_empty(name):
+    # a file forwarding the argument to an include reads it while only listed
+    context = LaunchContext()
+    assert SimpleLauncher().arg(name).perform(context) == ''
+    context.launch_configurations[name] = 'site.yaml'
+    assert SimpleLauncher().arg(name).perform(context) == 'site.yaml'
+    with pytest.raises(SubstitutionFailure):
+        SimpleLauncher().arg('other').perform(context)
 
 
 @pytest.mark.parametrize('name', FILE_ARGS)
@@ -185,26 +287,27 @@ def test_own_declaration_is_kept_and_moved_first(name):
     assert len(declared) == 1
     assert actions.index(declared[0]) < len(FILE_ARGS)
 
-    # the empty default of an included file runs later and changes nothing
+    # the listed argument of an included file runs later and changes nothing
     included = SimpleLauncher().launch_description().entities
     context = LaunchContext()
     assert value_after(actions + included, context, name) == 'site.yaml'
 
 
-def test_named_node_gets_its_sections_under_its_full_name():
-    merged = {'/**': section(shared=1, rate=1.0),
-              '/**/mode_fsm': section(rate=2.0),
-              '/**/other': section(x=1)}
+def test_sections_of_nodes_a_process_creates_are_kept():
+    # a Nav2 server creates its costmap as a node of its own process
+    merged = {'/**/controller_server': section(rate=2.0),
+              '/**/local_costmap': {'local_costmap': section(width=6)}}
 
-    assert node_sections(merged, '/brain/mode_fsm') == {
-        '/brain/mode_fsm': section(shared=1, rate=2.0)}
+    assert node_sections(merged) == {
+        '/**/**/controller_server': section(rate=2.0),
+        '/**/**/local_costmap': {'local_costmap': section(width=6)}}
 
 
 @pytest.mark.parametrize('name, namespace, push, expected', [
     ('mode_fsm', 'brain', None, '/brain/mode_fsm'),
     ('mode_fsm', None, 'brain', '/brain/mode_fsm'),
     ('rviz2', None, None, '/rviz2'),
-    (None, 'brain', None, None),
+    (None, 'brain', None, '/brain/exe'),
 ])
 def test_full_node_name(name, namespace, push, expected):
     context = LaunchContext()
@@ -213,4 +316,4 @@ def test_full_node_name(name, namespace, push, expected):
     node = Node(package='pkg', executable='exe', name=name, namespace=namespace)
     node._perform_substitutions(context)
 
-    assert full_node_name(node) == expected
+    assert full_node_name(node, 'exe') == expected
